@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MacBook 端控制程序 —— ESP32-S3 无线键盘桥（Python 版）
+控制端程序 —— ESP32-S3 无线键盘桥（Python 版，macOS / Windows 通用）
 
 功能与 mac_swift/ 里的 Swift 版对齐：
 
@@ -10,9 +10,13 @@ MacBook 端控制程序 —— ESP32-S3 无线键盘桥（Python 版）
   · 屏幕键盘：粘滞修饰键，点击走 DOWN → 30ms → UP（和本机转发同一条路径）
   · 鼠标：拖拽区移动指针 + 左中右三键 + 滚轮 + 「按住左键」+ 速度倍率
   · BIOS 引导键：写进固件（NVS 掉电保持）、立即连发、查询当前值
-  · 本机键盘转发：CGEventTap 全接管，修饰键镜像（Windows 上能切输入法），
-    ⌃⌥Esc 紧急停止
+  · 本机键盘转发：整块键盘接管，修饰键镜像（Windows 上能切输入法），
+    Ctrl+Alt+Esc 紧急停止
   · 日志面板：显示固件回执（PONG / BOOTKEY:…）与错误
+
+两个平台的差异只在本机键盘转发这一层：
+    macOS   CGEventTap（需要 pyobjc + 辅助功能授权）
+    Windows SetWindowsHookEx(WH_KEYBOARD_LL)（ctypes 直接调，无需额外依赖/授权）
 
 用法：
     python3 ble_keyboard_client.py                     # 图形界面
@@ -22,12 +26,13 @@ MacBook 端控制程序 —— ESP32-S3 无线键盘桥（Python 版）
 
 依赖：
     pip3 install -r requirements.txt
-    bleak              必需（蓝牙链路）
-    pyobjc-framework-Quartz  可选，只用于「本机键盘转发」
+    bleak                    必需（蓝牙链路）
+    pyobjc-framework-Quartz  仅 macOS，只用于「本机键盘转发」
 """
 
 import argparse
 import asyncio
+import ctypes
 import math
 import os
 import queue
@@ -41,9 +46,22 @@ from pathlib import Path
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import font as tkfont
+    from tkinter import messagebox, ttk
 except ImportError:      # 允许在无 tkinter 的环境下使用 --cli
     tk = None
+    tkfont = None
+
+IS_WIN = sys.platform.startswith("win")
+IS_MAC = sys.platform == "darwin"
+
+# 紧急停止组合键：两个平台上分别是 ⌃⌥Esc 和 Ctrl+Alt+Esc
+STOP_COMBO = "Ctrl+Alt+Esc" if IS_WIN else "⌃⌥Esc"
+
+# 界面字体：macOS 用 Helvetica/Menlo（和预览图一致），Windows 用系统自带的
+# 中文字体，否则中文标签会落到没有中文字形的西文字体上。
+UI_FAMILY = "Helvetica"
+MONO_FAMILY = "Menlo"
 
 try:
     import Quartz
@@ -86,6 +104,10 @@ TCC_HINT = (
     "请双击项目里的 ESP32Keyboard.app 启动；\n"
     "若还没有它，先运行 mac_client/build_app.sh 生成。"
 )
+
+# 被系统强杀的退出码（Windows 上没有 SIGKILL 这个常量，用 getattr 兜一下）
+_KILLED_CODES = tuple(getattr(signal, name) for name in ("SIGKILL", "SIGABRT")
+                      if hasattr(signal, name))
 
 
 class Cmd:
@@ -200,6 +222,64 @@ CLASS_OF_TOKEN = {
     "lcmd": "cmd", "rcmd": "cmd",
 }
 
+
+def _build_vk_table():
+    """Windows 虚拟键码（VK_*）→ 协议键名。
+
+    和上面的 Mac 表一样是固定 US 布局：被控主机按 US 布局解释键码，
+    两边一致才不会串字符。固件只认 f1..f12，所以 F13 以上故意不映射
+    （按了会放行给本机，不会被吞掉也没反应）。
+    """
+    table = {
+        0x08: "backspace", 0x09: "tab", 0x0D: "enter", 0x13: "pause",
+        0x14: "capslock", 0x1B: "esc", 0x20: "space",
+        0x21: "pageup", 0x22: "pagedown", 0x23: "end", 0x24: "home",
+        0x25: "left", 0x26: "up", 0x27: "right", 0x28: "down",
+        0x2C: "printscreen", 0x2D: "insert", 0x2E: "delete",
+        0x5D: "menu", 0x90: "numlock", 0x91: "scrolllock",
+        # 符号键（US 布局）
+        0xBA: ";", 0xBB: "=", 0xBC: ",", 0xBD: "-", 0xBE: ".", 0xBF: "/",
+        0xC0: "`", 0xDB: "[", 0xDC: "\\", 0xDD: "]", 0xDE: "'",
+        # 小键盘符号
+        0x6A: "kpasterisk", 0x6B: "kpplus", 0x6D: "kpminus",
+        0x6E: "kpdot", 0x6F: "kpslash",
+    }
+    for i in range(10):
+        table[0x30 + i] = str(i)               # 主键盘 0-9
+        table[0x60 + i] = f"kp{i}"             # 小键盘 0-9
+    for i in range(26):
+        table[0x41 + i] = chr(ord("a") + i)    # A-Z
+    for i in range(12):
+        table[0x70 + i] = f"f{i + 1}"          # F1-F12
+    return table
+
+
+VK_TO_TOKEN = _build_vk_table()
+
+
+def _win_modifier_token(vk, scan, flags):
+    """Windows 修饰键 → 侧别 token（lshift/rshift/…），不是修饰键返回 None。
+
+    LL 钩子一般直接给 VK_LSHIFT / VK_RCONTROL 这类分左右的码；
+    偶尔只给通用的 VK_SHIFT / VK_CONTROL，这时靠扫描码和扩展位判左右。
+    """
+    simple = {
+        0xA0: "lshift", 0xA1: "rshift",
+        0xA2: "lctrl", 0xA3: "rctrl",
+        0xA4: "lalt", 0xA5: "ralt",
+        0x5B: "lcmd", 0x5C: "rcmd",
+    }
+    if vk in simple:
+        return simple[vk]
+    extended = bool(flags & 0x01)              # LLKHF_EXTENDED
+    if vk == 0x10:                             # VK_SHIFT
+        return "rshift" if scan == 0x36 else "lshift"
+    if vk == 0x11:                             # VK_CONTROL
+        return "rctrl" if extended else "lctrl"
+    if vk == 0x12:                             # VK_MENU
+        return "ralt" if extended else "lalt"
+    return None
+
 # CGEventFlags 的四个修饰位（与 Quartz 常量等值，避免依赖常量是否存在）
 FLAG_SHIFT = 0x00020000
 FLAG_CONTROL = 0x00040000
@@ -222,8 +302,12 @@ class ModifierMirror:
     def reset(self):
         self.tokens.clear()
 
-    def sync(self, shift, control, alt, cmd, side_keycode=None):
-        """返回 (要松开的 token 列表, 要按下的 token 列表)。先松后按。"""
+    def sync(self, shift, control, alt, cmd, side_token=None):
+        """返回 (要松开的 token 列表, 要按下的 token 列表)。先松后按。
+
+        side_token 是「刚刚变化的修饰键」的侧别 token（lshift/rctrl/…），
+        用它决定按下哪一侧；两个平台传进来的是同一种 token。
+        """
         want = set()
         if shift:
             want.add("shift")
@@ -244,9 +328,8 @@ class ModifierMirror:
         for cls in MODIFIER_CLASSES:
             if cls in want and cls not in self.tokens:
                 token = DEFAULT_MOD_TOKEN[cls]
-                side = SIDE_KEY_TOKENS.get(side_keycode) if side_keycode is not None else None
-                if side and CLASS_OF_TOKEN.get(side) == cls:
-                    token = side
+                if side_token and CLASS_OF_TOKEN.get(side_token) == cls:
+                    token = side_token
                 press.append(token)
                 self.tokens[cls] = token
 
@@ -602,24 +685,52 @@ class Link:
         return handler
 
     async def _ble_find(self, BleakScanner, gen, name):
+        """扫到目标设备就返回。
+
+        不只看设备名：Windows 上未配对的设备经常报不出 name，
+        这时靠广告里的自定义服务 UUID 也能认出来（固件一定会广播它）。
+        """
         deadline = time.monotonic() + SCAN_TIMEOUT
         while time.monotonic() < deadline:
             if self._stop.is_set() or not self._alive(gen):
                 return None
             step = max(0.6, min(2.0, deadline - time.monotonic()))
             try:
-                found = await BleakScanner.discover(timeout=step)
+                found = await BleakScanner.discover(timeout=step, return_adv=True)
+                pairs = list(found.values())
+            except TypeError:                          # 老 bleak 没有 return_adv
+                try:
+                    pairs = [(dev, None) for dev in await BleakScanner.discover(timeout=step)]
+                except Exception as exc:               # noqa: BLE001
+                    self.fail_reason = f"扫描出错: {exc}"
+                    self._log(gen, self.fail_reason, True)
+                    return None
             except Exception as exc:                   # noqa: BLE001
                 self.fail_reason = f"扫描出错: {exc}"
                 self._log(gen, self.fail_reason, True)
                 return None
-            for dev in found:
-                dev_name = dev.name or ""
-                if dev_name == name or (name and name.lower() in dev_name.lower()):
+
+            for dev, adv in pairs:
+                if self._is_target(dev, adv, name):
                     return dev
             if not self._alive(gen):
                 return None
         return None
+
+    @staticmethod
+    def _is_target(dev, adv, name):
+        candidates = [dev.name or ""]
+        local_name = getattr(adv, "local_name", None)
+        if local_name:
+            candidates.append(local_name)
+        wanted = (name or "").lower()
+        for candidate in candidates:
+            if wanted and (candidate.lower() == wanted or wanted in candidate.lower()):
+                return True
+        for uuid in getattr(adv, "service_uuids", None) or ():
+            if str(uuid).lower() == SERVICE_UUID.lower():
+                return True
+        return False
 
     async def _ble_send(self, client, line):
         payload = (line + "\n").encode("utf-8")
@@ -768,7 +879,7 @@ class Link:
             return
         if proc.returncode == 0:
             self._probe_done = False
-        elif proc.returncode < 0 and -proc.returncode in (signal.SIGKILL, signal.SIGABRT):
+        elif proc.returncode < 0 and -proc.returncode in _KILLED_CODES:
             self._probe_done = True
         else:
             self._probe_done = False
@@ -958,7 +1069,9 @@ class KeyForwarder:
         return event
 
     def _sync_modifiers(self, shift, control, alt, cmd, side):
-        release, press = self._mirror.sync(shift, control, alt, cmd, side)
+        release, press = self._mirror.sync(
+            shift, control, alt, cmd,
+            SIDE_KEY_TOKENS.get(side) if side is not None else None)
         for token in release:
             self.on_command(Cmd.up(token))
         for token in press:
@@ -996,6 +1109,224 @@ def _tap_callback(proxy, event_type, event, refcon):
 
 
 # ---------------------------------------------------------------------------
+# 三之二、Windows 版本机键盘转发（SetWindowsHookEx + WH_KEYBOARD_LL）
+# ---------------------------------------------------------------------------
+class WinKeyForwarder:
+    """接管本机键盘，把每一次按键原样转给被控主机。
+
+    和 macOS 版是同一套规则：修饰键按「当前按下的集合」全量镜像、过滤自动
+    重复、Ctrl+Alt+Esc 永远优先、没映射的键放行给本机。区别只在钩子本身：
+    Windows 用 ctypes 直接调 Win32 的低层键盘钩子，不需要装任何依赖，
+    也不需要授权（只有「以管理员运行的窗口」的按键抓不到，这是系统限制）。
+    """
+
+    TARGET_THREAD_WM_QUIT = 0x0012
+    LLKHF_EXTENDED = 0x01
+
+    def __init__(self, on_command, on_log):
+        self.on_command = on_command
+        self.on_log = on_log
+        self.on_stop = None            # Ctrl+Alt+Esc 触发时通知界面
+        self.capturing = False
+        self._thread = None
+        self._thread_id = 0
+        self._hook_proc = None         # 保住回调引用，否则会被 GC
+        self._mirror = ModifierMirror()
+        self._mods = {}                # 语义类 -> 侧别 token（lshift/rshift/…）
+        self._held = set()             # 当前按下、可映射的 vk
+        self._warned = set()
+
+    # -- 静态信息 ---------------------------------------------------------
+    @staticmethod
+    def available():
+        return IS_WIN
+
+    @staticmethod
+    def trusted():
+        # Windows 抓键盘不需要授权；这里恒为 True，界面直接显示「可用」
+        return IS_WIN
+
+    @staticmethod
+    def prompt_trust():
+        pass                           # Windows 没有对应的授权流程
+
+    @staticmethod
+    def open_settings():
+        pass                           # 同上：没有需要打开的设置页
+
+    # -- 启停 -------------------------------------------------------------
+    def start(self):
+        if self.capturing:
+            return True
+        if not IS_WIN:
+            self.on_log("本机键盘转发只在 macOS / Windows 上可用", True)
+            return False
+        self.capturing = True
+        self._mods.clear()
+        self._held.clear()
+        self._mirror.reset()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self):
+        self.capturing = False
+        tid = self._thread_id
+        if not tid:
+            return
+        try:
+            ctypes.windll.user32.PostThreadMessageW(tid, self.TARGET_THREAD_WM_QUIT, 0, 0)
+        except Exception:                              # noqa: BLE001
+            pass
+
+    # -- 钩子线程 ---------------------------------------------------------
+    def _run(self):
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class KBDLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [("vkCode", wintypes.DWORD),
+                        ("scanCode", wintypes.DWORD),
+                        ("flags", wintypes.DWORD),
+                        ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_void_p)]
+
+        # LRESULT CALLBACK proc(int nCode, WPARAM wParam, LPARAM lParam)
+        hookproc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                           ctypes.c_size_t, ctypes.c_ssize_t)
+
+        def low_level_proc(n_code, w_param, l_param):
+            try:
+                if n_code == 0:                        # HC_ACTION
+                    info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    if self._handle(int(w_param), int(info.vkCode),
+                                    int(info.scanCode), int(info.flags)):
+                        return 1                       # 吞掉：本机看不到这次按键
+            except Exception:                          # noqa: BLE001
+                pass
+            return int(user32.CallNextHookEx(None, n_code, w_param, l_param))
+
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, hookproc_type,
+                                             ctypes.c_void_p, wintypes.DWORD]
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                          ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+
+        self._thread_id = int(kernel32.GetCurrentThreadId())
+        proc = hookproc_type(low_level_proc)
+        self._hook_proc = proc
+
+        WH_KEYBOARD_LL = 13
+        hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, proc, None, 0)
+        if not hook:
+            self.capturing = False
+            self._thread_id = 0
+            self.on_log(f"安装键盘钩子失败（错误码 {ctypes.get_last_error()}）", True)
+            return
+
+        self.on_log(f"捕获已开启：本机按键会转发给主机（{STOP_COMBO} 停止）")
+
+        msg = wintypes.MSG()
+        try:
+            while self.capturing:
+                got = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if got in (0, -1):                     # WM_QUIT 或出错
+                    break
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:                       # noqa: BLE001
+            self.on_log(f"键盘钩子异常: {exc}", True)
+        finally:
+            try:
+                user32.UnhookWindowsHookEx(hook)
+            except Exception:                          # noqa: BLE001
+                pass
+            self._thread_id = 0
+            self._hook_proc = None
+            self.capturing = False
+            self._release_all()
+            self.on_log("捕获已停止")
+
+    # -- 事件处理 ---------------------------------------------------------
+    def _handle(self, wparam, vk, scan, flags):
+        """返回 True 表示吞掉这次按键（本机不再处理）。"""
+        down = wparam in (0x0100, 0x0104)      # WM_KEYDOWN / WM_SYSKEYDOWN
+        up = wparam in (0x0101, 0x0105)        # WM_KEYUP / WM_SYSKEYUP
+        if not down and not up:
+            return False
+
+        side = _win_modifier_token(vk, scan, flags)
+        if side is not None:
+            cls = CLASS_OF_TOKEN[side]
+            if down:
+                self._mods[cls] = side
+            else:
+                self._mods.pop(cls, None)
+            self._sync_modifiers(side)
+            return True                        # 修饰键不留给本机
+
+        if down and vk == 0x1B and "ctrl" in self._mods and "alt" in self._mods:
+            self._request_stop()
+            return True
+
+        token = VK_TO_TOKEN.get(vk)
+        if token is None:
+            if down:
+                self._warn_unmapped(vk)
+            return False                       # 放行给本机
+        if down:
+            if vk in self._held:
+                return True                    # 自动重复：主机自己会重复
+            self._held.add(vk)
+            self.on_command(Cmd.down(token))
+            return True
+        self._held.discard(vk)
+        self.on_command(Cmd.up(token))
+        return True
+
+    def _sync_modifiers(self, side_token):
+        release, press = self._mirror.sync(
+            "shift" in self._mods, "ctrl" in self._mods,
+            "alt" in self._mods, "cmd" in self._mods, side_token)
+        for token in release:
+            self.on_command(Cmd.up(token))
+        for token in press:
+            self.on_command(Cmd.down(token))
+
+    def _request_stop(self):
+        def later():
+            self.stop()
+            self.on_log(f"{STOP_COMBO}：已停止捕获并松开所有按键")
+            if self.on_stop:
+                self.on_stop()
+        threading.Timer(0.05, later).start()
+
+    def _release_all(self):
+        self._mirror.reset()
+        self._mods.clear()
+        self._held.clear()
+        self.on_command(Cmd.RELEASE_ALL)
+
+    def _warn_unmapped(self, vk):
+        if vk in self._warned:
+            return
+        self._warned.add(vk)
+        self.on_log(f"跳过未映射的键（vkCode 0x{vk:02X}），它不在当前键表里")
+
+
+# 两个平台的实现，界面只用 FORWARDER_CLASS 这一个名字
+FORWARDER_CLASS = WinKeyForwarder if IS_WIN else KeyForwarder
+
+
+def make_forwarder(on_command, on_log):
+    return FORWARDER_CLASS(on_command, on_log)
+
+
+# ---------------------------------------------------------------------------
 # 四、图形界面
 # ---------------------------------------------------------------------------
 CARD_BG = "#ffffff"
@@ -1010,7 +1341,7 @@ OK = "#34c759"
 def _mk_card(parent, title):
     frame = tk.LabelFrame(parent, text=" " + title + " ", padx=10, pady=8,
                           fg=INK_SOFT, bg=CARD_BG, bd=1, relief="solid",
-                          font=("Helvetica", 11, "bold"))
+                          font=(UI_FAMILY, 11, "bold"))
     return frame
 
 
@@ -1019,7 +1350,7 @@ class App:
         self.root = root
         self.events = queue.Queue()
         self.link = Link(self.events.put)
-        self.fwd = KeyForwarder(self._fwd_command, self._fwd_log)
+        self.fwd = make_forwarder(self._fwd_command, self._fwd_log)
         self.fwd.on_stop = self._fwd_stopped
 
         self.sticky = set()
@@ -1184,10 +1515,11 @@ class App:
                                           bd=0, padx=8, pady=4, bg="#e6e6e9",
                                           state="disabled")
         self.capture_stop_btn.pack(side="left", padx=6)
-        tk.Button(btns, text="授权设置", command=KeyForwarder.open_settings,
-                  relief="flat", bd=0, padx=8, pady=4, bg="#e6e6e9").pack(side="left")
+        if IS_MAC:      # Windows 不需要授权，这个按钮没有意义
+            tk.Button(btns, text="授权设置", command=FORWARDER_CLASS.open_settings,
+                      relief="flat", bd=0, padx=8, pady=4, bg="#e6e6e9").pack(side="left")
 
-        tk.Label(card, text="捕获期间本机按键被吞掉、只发给主机；⌃⌥Esc 随时停止。",
+        tk.Label(card, text=f"捕获期间本机按键被吞掉、只发给主机；{STOP_COMBO} 随时停止。",
                  bg=CARD_BG, fg=INK_SOFT, justify="left", wraplength=320).grid(
             row=2, column=0, sticky="w", pady=(8, 0))
 
@@ -1261,7 +1593,7 @@ class App:
         for index, (label, combo) in enumerate(presets):
             btn = tk.Button(frame, text=label, relief="flat", bd=0, padx=3, pady=2,
                             bg="#f0f0f2", activebackground="#e2e2e6",
-                            font=("Helvetica", 10),
+                            font=(UI_FAMILY, 10),
                             command=lambda c=combo: self.on_combo(c))
             btn.grid(row=index // columns, column=index % columns,
                      sticky="ew", padx=2, pady=2)
@@ -1289,7 +1621,7 @@ class App:
             for col, (label, token) in enumerate(row):
                 btn = tk.Button(row_frame, text=label, relief="flat", bd=0, pady=3,
                                 bg="#f4f4f6", activebackground="#e2e2e6", fg=INK,
-                                font=("Helvetica", 10),
+                                font=(UI_FAMILY, 10),
                                 command=lambda t=token: self.on_key(t))
                 btn.grid(row=0, column=col, sticky="ew", padx=1)
                 self.key_buttons.setdefault(token, []).append(btn)
@@ -1309,7 +1641,7 @@ class App:
                              cursor="hand2")
         self.pad.grid(row=0, column=0, sticky="nsew")
         self._pad_hint = self.pad.create_text(145, 52, text="按住拖动",
-                                              fill="#8e8e93", font=("Helvetica", 11))
+                                              fill="#8e8e93", font=(UI_FAMILY, 11))
         self.pad.bind("<Configure>", self._pad_resize)
         self.pad.bind("<ButtonPress-1>", self._pad_down)
         self.pad.bind("<B1-Motion>", self._pad_drag)
@@ -1365,7 +1697,7 @@ class App:
         card.columnconfigure(0, weight=1)
 
         self.log_text = tk.Text(card, height=6, wrap="word", relief="flat", bd=0,
-                                bg="#fbfbfd", fg=INK, font=("Menlo", 10))
+                                bg="#fbfbfd", fg=INK, font=(MONO_FAMILY, 10))
         self.log_text.grid(row=0, column=0, sticky="ew")
         scroll = ttk.Scrollbar(card, orient="vertical", command=self.log_text.yview)
         scroll.grid(row=0, column=1, sticky="ns")
@@ -1452,18 +1784,22 @@ class App:
         self.disconnect_btn.configure(state="normal" if connected or busy else "disabled")
 
     def _refresh_trust(self):
-        if Quartz is None:
-            self.trust_var.set("未安装 pyobjc（不能转发本机键盘）")
+        if not FORWARDER_CLASS.available():
+            self.trust_var.set("未安装 pyobjc（不能转发本机键盘）" if IS_MAC
+                               else "当前平台不支持本机键盘转发")
             self.trust_dot.itemconfigure(self._trust_item, fill="#b0b0b5")
-        elif KeyForwarder.trusted():
-            self.trust_var.set("已授权辅助功能")
+        elif FORWARDER_CLASS.trusted():
+            self.trust_var.set("无需额外授权（可直接捕获）" if IS_WIN
+                               else "已授权辅助功能")
             self.trust_dot.itemconfigure(self._trust_item, fill=OK)
         else:
             self.trust_var.set("未授权辅助功能")
             self.trust_dot.itemconfigure(self._trust_item, fill=DANGER)
 
         capturing = self.fwd.capturing
-        self.capture_btn.configure(state="disabled" if capturing else "normal")
+        can_capture = FORWARDER_CLASS.available()
+        self.capture_btn.configure(state="normal" if can_capture and not capturing
+                                   else "disabled")
         self.capture_stop_btn.configure(state="normal" if capturing else "disabled")
         self.root.after(1000, self._refresh_trust)
 
@@ -1759,13 +2095,81 @@ def run_cli(mode, name, host, port):
     return 0
 
 
+def _ensure_streams():
+    """PyInstaller 的 --windowed 包里 stdout/stderr 是 None，print 会炸。"""
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            try:
+                setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+            except OSError:
+                pass
+
+
+def _resource_path(name):
+    """图标这类随程序走的资源：源码运行看本文件旁边，打包后看 _MEIPASS。"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
+
+
+def _enable_hi_dpi():
+    """Windows 上先声明 DPI 感知，否则 125%/150% 缩放下整个窗口是糊的。"""
+    if not IS_WIN:
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)      # 系统级 DPI 感知
+    except Exception:                                       # noqa: BLE001
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:                                   # noqa: BLE001
+            pass
+
+
+def _choose_fonts(root):
+    """按平台挑一个真实存在的字体，缺字体时中文会变成方块。"""
+    global UI_FAMILY, MONO_FAMILY
+    try:
+        families = set(tkfont.families(root))
+    except Exception:                                       # noqa: BLE001
+        return
+    ui = (("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "Arial") if IS_WIN
+          else ("Helvetica", "PingFang SC", "Arial"))
+    mono = (("Consolas", "Courier New") if IS_WIN else ("Menlo", "Monaco", "Courier"))
+    for name in ui:
+        if name in families:
+            UI_FAMILY = name
+            break
+    for name in mono:
+        if name in families:
+            MONO_FAMILY = name
+            break
+
+
+def _apply_window_icon(root):
+    """窗口和任务栏图标。macOS 的 Dock 图标由 .app 的 Info.plist 决定，这里不影响。"""
+    ico = _resource_path("app_icon.ico")
+    png = _resource_path("app_icon_256.png")
+    if IS_WIN and os.path.exists(ico):
+        try:
+            root.iconbitmap(default=ico)
+            return
+        except tk.TclError:
+            pass
+    if os.path.exists(png):
+        try:
+            image = tk.PhotoImage(file=png)
+            root.iconphoto(True, image)
+            root._icon_image = image        # 不存引用会被 GC，图标变成空白
+        except tk.TclError:
+            pass
+
+
 def _ensure_tcl_env():
     """给 Tk 指明 tcl/tk 库在哪。
 
     有些 Python 发行版（便携版、venv 套在便携版上）把 tcl 目录放在
-    <prefix>/lib/tcl9.0，而 Tk 自己的搜索路径只认编译时的前缀，
-    于是启动时报 “Cannot find a usable init.tcl”。这里按实际目录补上环境变量，
-    比让用户去设 TCL_LIBRARY 靠谱。
+    <prefix>/lib/tcl9.0 或 <prefix>/tcl/tcl8.6，而 Tk 自己的搜索路径只认
+    编译时的前缀，于是启动时报 “Cannot find a usable init.tcl”。
+    这里按实际目录补上环境变量，比让用户去设 TCL_LIBRARY 靠谱。
     """
     if os.environ.get("TCL_LIBRARY"):
         return
@@ -1773,8 +2177,9 @@ def _ensure_tcl_env():
     for base in (sys.base_prefix, sys.prefix):
         if not base:
             continue
-        for pattern in ("tcl8*/init.tcl", "tcl9*/init.tcl"):
-            candidates.extend(sorted(Path(base, "lib").glob(pattern)))
+        for folder in ("lib", "tcl"):
+            for pattern in ("tcl8*/init.tcl", "tcl9*/init.tcl"):
+                candidates.extend(sorted(Path(base, folder).glob(pattern)))
     if not candidates:
         return
     tcl_dir = candidates[0].parent
@@ -1786,6 +2191,7 @@ def _ensure_tcl_env():
 
 
 def main():
+    _ensure_streams()
     parser = argparse.ArgumentParser(description="ESP32-S3 无线键盘控制端（Python 版）")
     parser.add_argument("--name", default=DEFAULT_NAME, help="BLE 设备名")
     parser.add_argument("--mode", choices=("ble", "wifi"), default="ble", help="链路类型")
@@ -1802,8 +2208,11 @@ def main():
               "brew install python-tk", file=sys.stderr)
         return 1
 
+    _enable_hi_dpi()
     _ensure_tcl_env()
     root = tk.Tk()
+    _choose_fonts(root)
+    _apply_window_icon(root)
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     root.geometry(f"{min(1256, sw - 80)}x{min(900, sh - 120)}")
     App(root, args.name, args.host, args.port)

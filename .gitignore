@@ -9,6 +9,8 @@
 dist/
 build/
 mac_swift/build/
+mac_client/.build/
+dist_win/
 
 # PlatformIO
 .pio/

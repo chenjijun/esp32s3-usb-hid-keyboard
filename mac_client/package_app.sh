@@ -5,15 +5,15 @@
 #           源码、requirements.txt、build_app.sh、使用说明.txt
 #
 # 用法：
-#   ./package_app.sh                 # 版本默认 1.2.0
-#   VERSION=1.2.1 ./package_app.sh
+#   ./package_app.sh                 # 版本默认 1.2.1
+#   VERSION=1.2.2 ./package_app.sh
 #   PYTHON_BIN=/path/to/python3 ./package_app.sh
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
-VERSION="${VERSION:-1.2.0}"
+VERSION="${VERSION:-1.2.1}"
 STAGE="$ROOT/dist/ESP32Keyboard-Python-$VERSION"
 ZIP="$ROOT/dist/ESP32Keyboard-Python-$VERSION.zip"
 

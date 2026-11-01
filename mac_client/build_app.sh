@@ -15,7 +15,7 @@ ROOT="$(cd "$HERE/.." && pwd)"
 APP="${APP_OUT:-$ROOT/ESP32Keyboard.app}"
 PY="${PYTHON_BIN:-$(command -v python3 || true)}"
 BUNDLE_ID="local.esp32keyboard"
-VERSION="${VERSION:-1.2.0}"
+VERSION="${VERSION:-1.2.1}"
 # 启动脚本里写死哪个解释器：默认就是编译用的这个。
 # 打成发布包时传 LAUNCH_PY=""，改成运行时自己找 python3（别人机器上路径不一样）。
 LAUNCH_PY="${LAUNCH_PY-$PY}"
@@ -40,6 +40,12 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$HERE/ble_keyboard_client.py" "$APP/Contents/Resources/ble_keyboard_client.py"
+
+# 窗口图标（macOS 上窗口图标会被系统忽略，Dock 图标看 Info.plist；
+# 这份 PNG 主要是给打包后的界面用的，Windows 版用同名 .ico）
+if [ -f "$ROOT/app_icon_256.png" ]; then
+    cp "$ROOT/app_icon_256.png" "$APP/Contents/Resources/app_icon_256.png"
+fi
 
 # 有 Swift 版的图标就复用，没有就算了
 ICON_KEY=""

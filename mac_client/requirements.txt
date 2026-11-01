@@ -1,1 +1,7 @@
+# 蓝牙链路（必需）
 bleak>=0.21.1
+
+# 本机键盘转发（可选）：不装也能用屏幕键盘、鼠标、快捷键，
+# 只是点「开始捕获」会提示缺少 pyobjc。
+pyobjc-framework-Quartz>=10.0 ; sys_platform == "darwin"
+pyobjc-framework-ApplicationServices>=10.0 ; sys_platform == "darwin"

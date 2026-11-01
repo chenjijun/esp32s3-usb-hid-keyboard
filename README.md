@@ -56,10 +56,11 @@ esp32s3usbhid/
 │   ├── make_icon.sh               # app_icon.png → AppIcon.icns
 │   ├── build.sh                   # 编译 .app（支持 --universal）
 │   └── package.sh                 # 打 dmg / zip
-├── mac_client/                    # Python 版客户端（GUI + CLI）
-│   ├── ble_keyboard_client.py
-│   ├── build_app.sh
-│   └── requirements.txt
+├── mac_client/                    # Python 版客户端（GUI + CLI，功能与 Swift 版对齐）
+│   ├── ble_keyboard_client.py     # 协议 / 双链路 / 本机键盘转发 / Tkinter 界面 / CLI
+│   ├── build_app.sh              # 生成带蓝牙声明的 ESP32Keyboard.app
+│   ├── package_app.sh            # 打 dist/ESP32Keyboard-Python-<版本>.zip
+│   └── requirements.txt           # bleak（必需）+ pyobjc（本机转发用，可选）
 ├── docs/architecture.jpg          # 架构图（由 app.png 压缩而来，README 引用它）
 ├── app.png                        # 架构图原图
 ├── app_icon.png                   # 图标源图（方形裁切后使用）
@@ -307,7 +308,10 @@ cd mac_client
 python3 -m pip install -r requirements.txt
 ```
 
-用到的是 [`bleak`](https://github.com/hbldh/bleak)，macOS 上走 CoreBluetooth，无需额外驱动。
+- `bleak`：蓝牙链路，macOS 上走 CoreBluetooth，无需额外驱动。
+- `pyobjc-framework-Quartz` / `pyobjc-framework-ApplicationServices`：**可选**，只给
+  「本机键盘转发」用（CGEventTap）。不装也能用屏幕键盘、鼠标、快捷键，只是点
+  「开始捕获」会提示缺少 pyobjc。
 
 ### 2. 启动方式（重要，别直接用 python3 跑）
 
@@ -344,34 +348,61 @@ PYTHON_BIN=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3 ./buil
 程序里也做了权限预探测：万一你还是在终端里直接跑，它会明确告诉你原因并退出，
 不会再出现「窗口无故消失」。
 
-### 3. 界面功能
+要打一个可以发给别人的压缩包（含 App、源码、依赖清单、使用说明）：
 
+```bash
+cd mac_client
+./package_app.sh            # → dist/ESP32Keyboard-Python-1.2.0.zip
+```
+
+### 3. 界面功能（1.2.0 起与 Swift 版对齐）
+
+顶部两行：第一行选链路（**蓝牙 / Wi-Fi**）和地址，第二行是「连接 / 停止 / 断开 / 释放全部按键」
+加状态灯、状态文字、倒计时进度条。
+
+- **双链路**：和固件的 BOOT 键切换对应。蓝牙用设备名找；Wi-Fi 连板子热点里的
+  `192.168.4.1:8266`（先让笔记本连上热点 `ESP32-Keyboard`，密码 `esp32keyboard`）。
+- **连接有反馈**：扫描 / 连接分别有超时（蓝牙 12s 扫描、20s 建链；Wi-Fi 12s），
+  进度条会显示剩余秒数，失败自动重试 2 次；任何阶段都能点「停止」立刻中止，
+  不会卡在无限扫描里。
 - **文字**：输入字符串，点「输入」或「输入+回车」，走 `TYPE:` 命令，一次发一整段。
-- **常用快捷键**：顶部可切 `Windows / macOS` 两套预设。Windows 那套含
-  切换输入法（Win+Space）、中英切换（Ctrl+Space）、单按 Shift、布局切换（Ctrl+Shift）、
-  任务管理器、Win+D/E/R/I/L、Win+Shift+S 等，走 `COMBO:`。
-- **BIOS 启动键**：选 Del / F2 / F10 / F12 / Esc，点「写入固件」写进板子 NVS，
-  以后每次上电板子自己连发；「立即连发」用于已经开着机的情况。见「一、8」。
+- **常用快捷键**：`macOS / Windows` 两页预设。Windows 那页含切换输入法（Win+Space）、
+  中英切换（Ctrl+Space）、单按 Shift、布局切换（Ctrl+Shift）、任务管理器、
+  Win+D/E/R/I/L、Win+Shift+S 等，走 `COMBO:`。
+- **BIOS 启动键**：Del / F2 / F10 / F12 / F1 / F8 / Esc / 关闭。点一下写进板子 NVS
+  （掉电保持），另有「立即连发」「查询」，固件回 `BOOTKEY:…` 后界面会显示当前值。见「一、8」。
+- **鼠标**：左边一块拖拽区（按住拖动 = 移指针，速度 0.5×–4×），右边左/中/右三键
+  （按下发 `MOUSE:down`、松手发 `MOUSE:up`）、滚轮 ↑↓、以及「按住左键」——
+  要框选或拖文件时先锁住主机左键，再拖拖拽区。位移按 30Hz 攒批发送，
+  超过 ±127 自动拆包，不会被 HID 的 int8 截断。
+- **本机键盘转发**：「开始捕获」后本机按键被吞掉、原样转给主机，修饰键按 flags 全量镜像，
+  所以 Windows 上 Shift、Ctrl+Space、Win+Space 这些纯修饰键操作也能生效。
+  ⌃⌥Esc 紧急停止。未映射的键会放行给本机而不是吞掉。
+  这条需要 pyobjc + 「辅助功能」授权。
 - **屏幕键盘**：完整 QWERTY + 方向键 + 空格。
-  - `⇧ ⌥ ⌘ ctrl` 是**粘滞键**：点一下变红（按下并保持），再按任意普通键会发送该键并自动松开修饰键。
-  - 例：点 `⌘` → 点 `⇧` → 点 `4`，等价于 `Cmd+Shift+4`。
+  - `⇧ ⌥ ⌘ ctrl` 是**粘滞键**：点一下高亮，再按任意普通键会发送组合并自动松开修饰键
+    （松手之后再松修饰键，组合才不会被拆散）。
   - 一次点击 = `DOWN:` + 30ms + `UP:`，**和「开始捕获」走的是同一条发送路径**，
     而不是让固件自己 `TAP:`。两条路各走各的曾经导致「捕获能打字母、屏幕键盘点了没反应」。
     连续快点时会自动排队（每次敲击都完整，不会粘成一个长按）。
-  - 未连接时点击不会有任何按键发出，日志里会写「未连接，刚才的按键没有发出去」。
-- **释放全部按键**：任何情况下按键卡住，点它（或断开连接）会发 `RELEASEALL`。
+  - 未连接时点击不会发出按键，日志里会写「未连接，刚才的按键没有发出去」。
+- **日志**：显示固件回执（`PONG:…`、`BOOTKEY:…`）、错误和连接阶段变化，最新 400 行。
+- **释放全部按键**：任何情况下按键卡住，点它（或断开连接）会发 `RELEASEALL` 并松开鼠标键。
 
 ### 4. 命令行模式
 
 不想开 GUI 或想接脚本时：
 
 ```bash
-python3 ble_keyboard_client.py --cli
+python3 ble_keyboard_client.py --cli                     # 蓝牙
+python3 ble_keyboard_client.py --cli --mode wifi         # Wi-Fi（默认 192.168.4.1:8266）
+python3 ble_keyboard_client.py --cli --mode wifi --host 192.168.4.1 --port 8266
 ```
 
-连上后逐行输入协议命令（见下表），适合调试。注意它同样受上面的 TCC 限制：
-只有在「有蓝牙声明的 App 的终端里」运行才不会被杀（例如 VS Code 的集成终端）。
-被拦时它会打印原因并以退出码 1 结束，不会静默崩溃。
+连上后逐行输入协议命令（见下表），适合调试；固件回执也会打印出来。
+注意蓝牙模式同样受上面的 TCC 限制：只有在「有蓝牙声明的 App 的终端里」运行才不会被杀
+（例如 VS Code 的集成终端）。被拦时它会打印原因并以退出码 1 结束，不会静默崩溃。
+Wi-Fi 模式不需要蓝牙权限，在终端里直接跑没问题。
 
 ---
 
@@ -511,6 +542,22 @@ SIGN_IDENTITY="ESP32KeyboardLocal" ./mac_swift/build.sh     # 以后都用这个
 ```
 
 之后重新编译不会再影响已有授权。
+
+### Python 版：依赖与授权
+
+Python 版（`mac_client/`）功能已经和 Swift 版一致，但有一处差别要注意：
+
+- **解释器换来换去，授权会丢。** 辅助功能是按「哪个程序在跑」授权的。用
+  `python3 ble_keyboard_client.py` 直接跑时，被授权的是那个 python 解释器；
+  换成 `.app` 启动，被授权的是 `.app` 里的同一个解释器路径——路径变了就要重新勾。
+  固定用 `ESP32Keyboard.app` 启动最省事。
+- **提示缺少 pyobjc**：`python3 -m pip install -r mac_client/requirements.txt`。
+  只有「本机键盘转发」需要它，屏幕键盘、鼠标、快捷键不受影响。
+- **蓝牙仍然必须走 .app**：TCC 只认带 `NSBluetoothAlwaysUsageDescription` 的 App。
+  Wi-Fi 模式不受这条限制，终端里直接跑也行。
+- **`build_app.sh` 会把 python 路径写进启动脚本**。之后换 Python 版本（或删了那个
+  venv / Homebrew Python），App 会改用 `command -v python3`，并在缺 bleak 时弹窗提示，
+  而不是毫无反应地退出。
 
 ### 连接超时与取消
 

@@ -790,3 +790,11 @@ CGEventTap 回调     Button 点击          DragGesture
 
 **Swift 版能不能只转发某些键**
 - 目前是全接管。想只转发特定组合（比如只转发 F13-F15 做快捷键）改 `KeyForwarder.handle` 里的判断即可。
+
+## 七、许可
+
+MIT License，见 [LICENSE](LICENSE)。商用、修改、再发布都可以，保留版权声明即可。
+
+固件依赖 [arduino-esp32](https://github.com/espressif/arduino-esp32)（LGPL-2.1），
+客户端使用 Apple 系统框架（CoreBluetooth / Network / ApplicationServices），
+各自遵循其原有许可。

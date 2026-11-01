@@ -1,0 +1,39 @@
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# 构建产物（源码在仓库里，产物请自己打包）
+*.app/
+dist/
+build/
+mac_swift/build/
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 工具
+.vscode/
+.idea/
+*.xcuserstate
+
+# 项目工作记录（不入库）
+.workbuddy/
+
+# 本地备份文件（编辑器/手工改版本时留下的）
+*.bal
+*.orig
+*.bak
+
+# 本地证书与私钥，不要外传
+*.p12
+*.cer

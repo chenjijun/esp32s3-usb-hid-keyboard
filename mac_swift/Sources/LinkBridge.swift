@@ -95,6 +95,10 @@ final class LinkBridge: NSObject, ObservableObject {
     @Published private(set) var phaseSeconds: Int = 0
     /// 正在找的设备名（界面提示用）
     @Published private(set) var targetDeviceName: String = Link.defaultName
+    /// 固件回报的引导键参数（BOOTCFG: 那一行）。nil 表示还没查过 / 固件太老不认这条
+    @Published private(set) var bootConfig: BootConfig?
+    /// 这次连接里固件有没有回过 BOOTKEY:（用来区分「旧固件」和「完全没响应」）
+    private var sawBootKeyReply = false
 
     /// 断开时回调（界面据此关闭键盘捕获，避免按键发进黑洞）
     var onDisconnect: (() -> Void)?
@@ -270,6 +274,63 @@ final class LinkBridge: NSObject, ObservableObject {
         if logs.count > 300 { logs.removeFirst(logs.count - 300) }
     }
 
+    /// 连上之后主动问一次固件里的引导键设置。
+    ///
+    /// 为什么必须问：客户端自己记的是「上次在这个 App 里点过什么」，固件记的是
+    /// 真值，两者可能不一致（换了机器、刷过固件、用手机端改过）。一旦不一致，
+    /// 用户点「写入固件」就会把界面上的旧值写回去——最典型的现象就是把已经设成
+    /// 「关闭」的引导键又改回了 delete，于是「设了关闭，开机还是敲键」。
+    /// 所以每次连上都对齐一次：以固件为准。
+    private func queryBootConfig() {
+        bootConfig = nil
+        sawBootKeyReply = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self, self.state.isConnected else { return }
+            self.send(Command.bootKeyQuery)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+                guard let self, self.state.isConnected, self.bootConfig == nil else { return }
+                if self.sawBootKeyReply {
+                    // 老固件：认识 BOOTKEY:<键>，但不认识 window/gap，也不回 BOOTCFG。
+                    // 键位是生效的，只是连发节奏改不了——说清楚，别让人以为整个功能坏了
+                    self.log("固件只回了 BOOTKEY:（旧固件）：键位能用，"
+                             + "但连发时长/间隔改不了。要用这两项得重新烧录当前固件", isError: true)
+                } else {
+                    self.log("固件没有回应 BOOTKEY:?：多半是更旧的固件（还不认识引导键命令），"
+                             + "用当前源码重新烧录一次即可", isError: true)
+                }
+            }
+        }
+    }
+
+    /// 收到一行固件回执。解析 BOOTCFG（引导键的完整参数）；
+    /// BOOTKEY: / BOOTKEY-ERR: 只用来判断固件新旧，其余（PONG / READY）只进日志。
+    private func noteIncoming(_ text: String) {
+        if text.hasPrefix("BOOTKEY:") {
+            sawBootKeyReply = true
+        } else if text.hasPrefix("BOOTKEY-ERR:") {
+            sawBootKeyReply = true
+            log("固件不认这条引导键命令：\(text.dropFirst("BOOTKEY-ERR:".count))", isError: true)
+            return
+        } else if !text.hasPrefix("BOOTCFG:") {
+            return
+        }
+        guard text.hasPrefix("BOOTCFG:") else { return }
+        var fields: [String: String] = [:]
+        for part in text.dropFirst("BOOTCFG:".count).split(separator: ",") {
+            let kv = part.split(separator: "=", maxSplits: 1)
+            if kv.count == 2 {
+                fields[String(kv[0]).trimmingCharacters(in: .whitespaces)] =
+                    String(kv[1]).trimmingCharacters(in: .whitespaces)
+            }
+        }
+        bootConfig = BootConfig(
+            key: fields["key"] ?? "?",
+            windowMs: Int(fields["win"] ?? "") ?? 0,
+            gapMs: Int(fields["gap"] ?? "") ?? 0,
+            holdMs: Int(fields["hold"] ?? "") ?? 0
+        )
+    }
+
     func clearLogs() { logs.removeAll() }
 
     // MARK: - 扫描 / 连接
@@ -400,6 +461,7 @@ final class LinkBridge: NSObject, ObservableObject {
                 self.state = .connected
                 self.log("Wi-Fi 链路就绪（\(self.wifiTarget)）")
                 self.receiveWiFi(conn)
+                self.queryBootConfig()
             case .waiting(let error):
                 self.log("网络暂不可达：\(error.localizedDescription)", isError: true)
             case .failed(let error):
@@ -439,6 +501,7 @@ final class LinkBridge: NSObject, ObservableObject {
                     self.wifiRxBuffer.removeSubrange(self.wifiRxBuffer.startIndex...idx)
                     if !line.isEmpty {
                         self.log("← \(line)")
+                        self.noteIncoming(line)
                     }
                 }
                 // 防止对端一直不发换行把内存撑大
@@ -683,6 +746,7 @@ extension LinkBridge: CBPeripheralDelegate {
                 write(data, to: peripheral, char: ch)
             }
         }
+        queryBootConfig()
     }
 
     func peripheral(_ peripheral: CBPeripheral,
@@ -691,6 +755,7 @@ extension LinkBridge: CBPeripheralDelegate {
         guard let value = characteristic.value,
               let text = String(data: value, encoding: .utf8) else { return }
         log("← \(text)")
+        noteIncoming(text)
     }
 }
 

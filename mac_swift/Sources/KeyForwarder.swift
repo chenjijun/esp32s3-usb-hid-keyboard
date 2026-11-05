@@ -22,6 +22,10 @@ final class KeyForwarder: ObservableObject {
     var onCommand: ((String) -> Void)?
     /// 过程性信息写日志，不占用界面上的提示位
     var onLog: ((String) -> Void)?
+    /// 捕获真的停下来了（不管是点按钮、快捷键还是菜单栏）。
+    /// 界面用它清掉屏幕键盘上「粘滞键」的高亮 —— 那些键早就松开了，
+    /// 从菜单栏停的时候窗口里还亮着一片，看着像没松开。
+    var onStop: (() -> Void)?
 
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
@@ -31,6 +35,26 @@ final class KeyForwarder: ObservableObject {
     private var mirror = ModifierMirror()
     /// 当前按住不放的普通键（避免重复 DOWN，也方便兜底释放）
     private var heldKeys: Set<Int64> = []
+    private var terminateObserver: NSObjectProtocol?
+
+    init() {
+        // 从菜单栏「退出」时进程直接结束，事件 tap 跟着消失，最后一次「松开」
+        // 就再也发不出去了 —— 主机上会留着一个按住的修饰键
+        // （典型现象：那边点什么都变成快捷键）。退出前先走一遍 stop()。
+        terminateObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.stop()
+        }
+    }
+
+    deinit {
+        if let terminateObserver {
+            NotificationCenter.default.removeObserver(terminateObserver)
+        }
+    }
 
     // MARK: - 权限
 
@@ -48,7 +72,12 @@ final class KeyForwarder: ObservableObject {
         if trusted {
             notice = nil
         } else {
-            notice = "系统仍判定未授权。若设置里已经勾选，是重新编译后签名变了：点右边圆形箭头重置，再重新添加本 App"
+            // 这里不再把「每次编译都要重授权」当成常态写进提示：build.sh 现在默认
+            // 用固定的自签证书签名（见 build.sh 顶部注释），重编不会让授权失效。
+            // 还出问题只可能是两种原因——这条记录是 ad-hoc 时期留下的，或者换了签名身份。
+            // 两种都能用下面的重置按钮救回来。
+            notice = "系统仍判定未授权。若设置里已经勾选本 App：点右边圆形箭头重置这条旧记录，"
+                + "再点「去授权」重新添加。若反复出现，跑一次 ./mac_swift/make_cert.sh 固定签名后重新编译"
         }
     }
 
@@ -59,11 +88,15 @@ final class KeyForwarder: ObservableObject {
 
     /// 清掉本 App 在 TCC 里的辅助功能记录，然后重新申请。
     ///
-    /// 为什么需要它：本项目用 ad-hoc 签名（没有开发者证书），TCC 是按「代码签名
-    /// 指纹」认人的，每次重新编译 cdhash 都会变。于是会出现一种坑人的状态——
-    /// 系统设置里那条开关仍是勾选的，但系统认为「这不是同一个程序」，
-    /// AXIsProcessTrusted() 一直返回 false，点「重新检测」永远不会变绿。
-    /// 只有把旧记录删掉、让系统重新记一次才行，这个按钮就是干这件事。
+    /// 为什么需要它：TCC 记的是「哪个 App」，而 App 的身份由代码签名决定。
+    /// 以前本项目用 ad-hoc 签名，唯一的标识是 cdhash，每次重编都变，于是出现一种
+    /// 坑人的状态——系统设置里那条开关仍勾着，但系统认为「这不是同一个程序」，
+    /// AXIsProcessTrusted() 一直 false，点「重新检测」永远不变绿。
+    ///
+    /// 现在 build.sh 默认用固定自签证书签名（指定要求里是 certificate leaf，
+    /// 不含 cdhash），重编不会再产生这种记录。但这个按钮还得留着：
+    /// 从 ad-hoc 切到固定证书的那一次、或者换了证书名之后，旧记录会残留成
+    /// 「勾着但不生效」的样子，只有删掉让它重记一次才行。
     func resetAccessibility() {
         guard let bundleID = Bundle.main.bundleIdentifier else {
             notice = "取不到 Bundle ID，无法重置"
@@ -154,6 +187,7 @@ final class KeyForwarder: ObservableObject {
             mirror.reset()
             heldKeys.removeAll()
         }
+        onStop?()
     }
 
     // MARK: - 事件处理（主线程）
@@ -198,15 +232,24 @@ final class KeyForwarder: ObservableObject {
             return nil
 
         case .keyDown:
-            // 紧急出口：⌃⌥Esc 停止捕获。判断要放在同步之前，
-            // 免得多发出一对 ctrl/alt。
-            if code == 53,
-               event.flags.contains(.maskControl),
-               event.flags.contains(.maskAlternate) {
+            // 紧急出口：⌃⌥Esc 或 ⌃⇧E 停止捕获。判断要放在同步之前，
+            // 免得多发出一对 ctrl/shift/alt。
+            //
+            // 为什么要两个：⌃⌥Esc 是 macOS 习惯，但这套组合在某些远程桌面 /
+            // 输入法里会被抢；⌃⇧E 在键盘左侧，左手一伸就到，按起来更快。
+            // 两个都判，任一命中就停。
+            let stopByEsc = code == 53
+                && event.flags.contains(.maskControl)
+                && event.flags.contains(.maskAlternate)
+            let stopByE = code == 14          // keyCode 14 = E
+                && event.flags.contains(.maskControl)
+                && event.flags.contains(.maskShift)
+            if stopByEsc || stopByE {
+                let how = stopByEsc ? "⌃⌥Esc" : "⌃⇧E"
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     self.stop()
-                    self.onLog?("已停止捕获（⌃⌥Esc）")
+                    self.onLog?("已停止捕获（\(how)）")
                 }
                 return nil
             }

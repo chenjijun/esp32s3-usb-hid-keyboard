@@ -30,8 +30,73 @@ final class UIState: ObservableObject {
     @Published var wifiPort = String(LinkKind.defaultPort)
     /// 快捷键区当前按哪套系统显示
     @Published var presetOS: PresetOS = .windows
-    /// 开机引导键（写进固件的那个）
-    @Published var biosKey = "delete"
+    /// 开机引导键（写进固件的那个）。
+    ///
+    /// 为什么要存本地：以前这里是写死的默认 "delete"，而「写入固件」会把当前
+    /// 选择原样发给板子。于是出现一个很难察觉的坑——用户在上一轮把引导键设成
+    /// 「关闭」，下次打开 App 时界面又回到 delete，随手点一下写入（哪怕只是
+    /// 想改连发时长），板子就被改回「开机敲 Del」，看起来像「关闭没生效」。
+    /// 现在既能记住上次的选择，连上后还会主动向固件问一次真值（见 LinkBridge）。
+    @Published var biosKey = UIState.loadBiosKey() {
+        didSet { UserDefaults.standard.set(biosKey, forKey: UIState.biosKeyKey) }
+    }
+
+    /// 连发时长（秒）和间隔（毫秒）。最终写给固件，客户端只记「这次要发什么」；
+    /// 连上后点「查询」会把固件里的真值拉回来覆盖这两个数。
+    @Published var bootWindowSeconds: Double = 10
+    @Published var bootGapMs: Double = 220
+
+    // MARK: 折叠
+    /// 收起来的卡片 id（bios / text / presets）。页面本来就长，这三块不是每次都用，
+    /// 收起来能少滚两屏。选择存 UserDefaults，下次打开还是那个样子。
+    @Published var collapsedSections: Set<String> = UIState.loadCollapsed() {
+        didSet {
+            UserDefaults.standard.set(Array(collapsedSections), forKey: UIState.collapseKey)
+        }
+    }
+
+    private static let collapseKey = "ui.collapsedSections"
+
+    private static func loadCollapsed() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: collapseKey) ?? [])
+    }
+
+    static let biosKeyKey = "ui.biosKey"
+
+    /// 上次写入固件的引导键。没有记录时按固件出厂默认（delete）显示，
+    /// 连上之后会被固件回报的真值覆盖。
+    private static func loadBiosKey() -> String {
+        UserDefaults.standard.string(forKey: biosKeyKey) ?? "delete"
+    }
+
+    /// 传给 Card 的展开状态（true = 展开）
+    func expanded(_ id: String) -> Binding<Bool> {
+        Binding(
+            get: { !self.collapsedSections.contains(id) },
+            set: { wantExpand in
+                var next = self.collapsedSections
+                if wantExpand { next.remove(id) } else { next.insert(id) }
+                self.collapsedSections = next
+            }
+        )
+    }
+
+    var bootWindowBinding: Binding<Double> {
+        Binding(get: { self.bootWindowSeconds }, set: { self.bootWindowSeconds = $0 })
+    }
+
+    var bootGapBinding: Binding<Double> {
+        Binding(get: { self.bootGapMs }, set: { self.bootGapMs = $0 })
+    }
+
+    /// 发给固件的连发时长（毫秒）。固件自己会夹范围，这里先夹一次免得发出去的数字离谱
+    var bootWindowMs: Int {
+        Int((min(max(bootWindowSeconds, 1), 60)) * 1000)
+    }
+
+    var bootGapValue: Int {
+        Int(min(max(bootGapMs, 60), 5000))
+    }
 
     // MARK: 鼠标
     /// 当前按着的鼠标键（界面高亮用；真实状态在固件里）
@@ -163,48 +228,59 @@ struct ContentView: View {
     @EnvironmentObject private var forwarder: KeyForwarder
     @StateObject private var ui = UIState()
 
+    /// 滚动区里的那一列卡片。抽成独立属性纯粹是为了 body 短一点，
+    /// 也方便以后单独给这一列做截图 / 渲染测试。
+    var contentColumn: some View {
+        VStack(spacing: 12) {
+            if bridge.kind == .wifi { wifiCard }
+            captureCard
+            bootCard
+            textCard
+            presetsCard
+            // 屏幕键盘和鼠标并排：键盘在左（宽度自适应，键位多、需要横向空间），
+            // 鼠标在右（固定列宽 —— 窄列里拖拽区在上、按键在下的纵向排布更顺手）。
+            // 高度以键盘卡为准，鼠标卡跟它齐平（两栏底部对齐，看着才整齐）。
+            HStack(alignment: .top, spacing: 12) {
+                keyboardCard
+                    .background(
+                        GeometryReader { g in
+                            Color.clear
+                                .onAppear { ui.boardHeight = g.size.height }
+                                .onChange(of: g.size.height) { _, h in ui.boardHeight = h }
+                        }
+                    )
+                mouseCard
+                    .frame(width: 320)
+                    // 200 是「量到之前」的兜底：没量到就让卡片按内容自然高度长
+                    .frame(height: ui.boardHeight > 200 ? ui.boardHeight : nil,
+                           alignment: .top)
+            }
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().opacity(0.5)
+            GradientRule()
             ScrollView {
-                VStack(spacing: 12) {
-                    if bridge.kind == .wifi { wifiCard }
-                    captureCard
-                    bootCard
-                    textCard
-                    presetsCard
-                    // 屏幕键盘和鼠标并排：键盘在左（宽度自适应，键位多、需要横向空间），
-                    // 鼠标在右（固定列宽 —— 窄列里拖拽区在上、按键在下的纵向排布更顺手）。
-                    // 高度以键盘卡为准，鼠标卡跟它齐平（两栏底部对齐，看着才整齐）。
-                    HStack(alignment: .top, spacing: 12) {
-                        keyboardCard
-                            .background(
-                                GeometryReader { g in
-                                    Color.clear
-                                        .onAppear { ui.boardHeight = g.size.height }
-                                        .onChange(of: g.size.height) { _, h in ui.boardHeight = h }
-                                }
-                            )
-                        mouseCard
-                            .frame(width: 320)
-                            // 200 是「量到之前」的兜底：没量到就让卡片按内容自然高度长
-                            .frame(height: ui.boardHeight > 200 ? ui.boardHeight : nil,
-                                   alignment: .top)
-                    }
-                }
-                .padding(14)
+                contentColumn
+                    .padding(14)
             }
-            Divider().opacity(0.5)
+            GradientRule()
             logBar
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        // 底色用品牌调过的画布色，而不是系统 windowBackgroundColor：
+        // 系统那套是中性灰，配青紫强调会显脏；这里是同一明度但偏冷一点的底
+        .background(Palette.canvas)
         .onAppear {
             let bridgeRef = bridge
             let fwd = forwarder
             let uiRef = ui
             fwd.onCommand = { [weak bridgeRef] line in bridgeRef?.send(line) }
             fwd.onLog = { [weak bridgeRef] text in bridgeRef?.log(text) }
+            // 停止清理由 forwarder 统一回调：这样从菜单栏停、从快捷键停，
+            // 窗口里的粘滞键高亮也会一起灭掉
+            fwd.onStop = { [weak uiRef] in uiRef?.sticky.removeAll() }
             uiRef.send = { [weak bridgeRef] line in bridgeRef?.send(line) }
             fwd.refreshTrust()
             bridgeRef.onDisconnect = { [weak fwd, weak uiRef] in
@@ -225,7 +301,7 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(statusTitle)
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .foregroundStyle(bridge.state.isBusy ? Color.orange : Color.primary)
+                        .foregroundStyle(bridge.state.isBusy ? Palette.busy : Palette.title)
                         .lineLimit(1)
                         .fixedSize(horizontal: false, vertical: true)
                     if !statusDetail.isEmpty {
@@ -240,14 +316,12 @@ struct ContentView: View {
                 Spacer(minLength: 14)
 
                 // 链路模式：必须和板子上 BOOT 键选的一致（灯色可以对照）
-                Picker("", selection: Binding(get: { bridge.kind }, set: { bridge.kind = $0 })) {
-                    ForEach(LinkKind.allCases) { kind in
-                        Text(kind.label).tag(kind)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 116)
+                // 用自绘分段控件而不是 Picker(.segmented)：后者的选中块是系统强调色，
+                // 在青紫配色里会突兀地冒出一块系统蓝（tint 对它不生效）
+                BrandSegmented(
+                    options: LinkKind.allCases.map { (label: $0.label, value: $0) },
+                    selection: Binding(get: { bridge.kind }, set: { bridge.kind = $0 })
+                )
                 .disabled(bridge.state.isBusy || bridge.state.isConnected)
                 .help(bridge.kind == .ble
                       ? "蓝牙链路：按设备名扫描并连接"
@@ -275,6 +349,10 @@ struct ContentView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 9)
         .background(.regularMaterial)
+        // 顶栏和内容区之间那一条：换成细的青紫渐变，比纯 Divider 有品牌感
+        .overlay(alignment: .bottom) {
+            GradientRule(opacity: 0.45)
+        }
     }
 
     /// 左侧状态点：空闲是彩色圆点，扫描/连接时换成转圈，给「正在做事」的反馈
@@ -284,10 +362,13 @@ struct ContentView: View {
             SpinningArc()
                 .help("正在进行中，可以点「停止」中止")
         } else {
+            // 一圈同色光晕：亮色底上看得出来「在发光」，深色底上也不刺眼
             Circle()
                 .fill(statusColor)
                 .frame(width: 9, height: 9)
-                .overlay(Circle().strokeBorder(Color.black.opacity(0.06)))
+                .overlay(Circle().strokeBorder(Color.white.opacity(0.35), lineWidth: 0.8))
+                .shadow(color: statusColor.opacity(0.55), radius: 4)
+                .frame(width: 11, height: 11)
         }
     }
 
@@ -307,7 +388,7 @@ struct ContentView: View {
                 .frame(minWidth: 58)
             }
             .buttonStyle(.borderedProminent)
-            .tint(.red)
+            .tint(Palette.dangerButton)
             .help("立即停止扫描/连接，不用等超时")
         } else if bridge.state.isConnected {
             Button {
@@ -338,6 +419,7 @@ struct ContentView: View {
                 .frame(minWidth: 58)
             }
             .buttonStyle(.borderedProminent)
+            .tint(Palette.brandButton)
             .help(bridge.kind == .ble
                   ? "按设备名扫描并连接（最长 12 秒）"
                   : "连到 \(ui.wifiHost):\(ui.wifiPort)（最长 6 秒）")
@@ -377,9 +459,10 @@ struct ContentView: View {
         let done = min(max(Double(total - bridge.remainingSeconds) / Double(total), 0), 1)
         return GeometryReader { geo in
             ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.08))
+                Capsule().fill(Palette.well)
+                // 进度条本身走品牌渐变：青 → 紫，跑起来像一条光带
                 Capsule()
-                    .fill(Color.orange)
+                    .fill(Palette.brandGradient)
                     .frame(width: geo.size.width * done)
             }
         }
@@ -390,10 +473,10 @@ struct ContentView: View {
 
     private var statusColor: Color {
         switch bridge.state {
-        case .connected: return .green
-        case .scanning, .connecting: return .orange
+        case .connected: return Palette.ok
+        case .scanning, .connecting: return Palette.busy
         case .idle: return Color.secondary
-        default: return .red
+        default: return Palette.danger
         }
     }
 
@@ -404,7 +487,7 @@ struct ContentView: View {
 
     /// 状态点右侧的一行小字，说明现在卡在哪一步、下一步该做什么
     private var statusDetail: String {
-        if forwarder.isCapturing { return "⌃⌥Esc 随时停止捕获" }
+        if forwarder.isCapturing { return "⌃⇧E 随时停止捕获" }
 
         if bridge.state.isBusy {
             let phase: String
@@ -518,6 +601,10 @@ struct ContentView: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(Color.secondary)
 
+                // 主操作紧跟标题靠左：这条横条接近整窗宽，按钮放到最右边
+                // 就离标题隔了大半屏，点它之前眼睛得先扫一圈
+                captureButton
+
                 Spacer(minLength: 8)
 
                 permissionChip
@@ -537,16 +624,14 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(Color.secondary)
-                    .help("已勾选但一直显示未授权时点这里。会清掉失效的旧授权记录，然后需要重新添加本 App（ad-hoc 签名每次重新编译指纹都会变）")
+                    .help("已勾选但一直显示未授权时点这里。会清掉失效的旧授权记录，然后需要重新添加本 App（签名身份换过之后，旧记录会残留成「勾着但不生效」）")
                 }
-
-                captureButton
             }
 
             if let notice = forwarder.notice {
                 Text(notice)
                     .font(.system(size: 10.5))
-                    .foregroundStyle(Color.orange)
+                    .foregroundStyle(Palette.warn)
                     .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -554,32 +639,26 @@ struct ContentView: View {
         .padding(.horizontal, 13)
         .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.07))
-        )
-        .help("开启捕获后，在这台 Mac 上敲的键会发给被控主机，本机不再响应。按 ⌃⌥Esc 随时停止。")
+        // 这条横条本质也是一张卡，共用同一套卡片底，改配色时不用改两处
+        .cardSurface(cornerRadius: 13)
+        .help("开启捕获后，在这台 Mac 上敲的键会发给被控主机，本机不再响应。按 ⌃⇧E（或 ⌃⌥Esc）随时停止。")
     }
 
     private var captureButton: some View {
         Group {
             if forwarder.isCapturing {
                 Button("停止捕获") {
-                    forwarder.stop()
-                    ui.sticky.removeAll()
+                    forwarder.stop()      // 粘滞键高亮由 forwarder.onStop 统一清
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.red)
-                .help("也可以用 ⌃⌥Esc 紧急停止")
+                .tint(Palette.dangerButton)
+                .help("也可以用 ⌃⇧E 或 ⌃⌥Esc 紧急停止")
             } else {
                 Button("开始捕获") {
                     _ = forwarder.start()
                 }
                 .buttonStyle(.borderedProminent)
+                .tint(Palette.brandButton)
                 .disabled(!bridge.state.isConnected)
             }
         }
@@ -589,16 +668,18 @@ struct ContentView: View {
     /// 权限状态压成一个胶囊，取代原来那一整行说明
     private var permissionChip: some View {
         let ok = forwarder.trusted
+        let tint = ok ? Palette.ok : Palette.warn
         return HStack(spacing: 4) {
             Image(systemName: ok ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
                 .font(.system(size: 10))
             Text(ok ? "辅助功能已授权" : "需辅助功能权限")
                 .font(.system(size: 11, weight: .medium))
         }
-        .foregroundStyle(ok ? Color.green : Color.orange)
+        .foregroundStyle(tint)
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
-        .background(Capsule().fill((ok ? Color.green : Color.orange).opacity(0.12)))
+        .background(Capsule().fill(tint.opacity(0.13)))
+        .overlay(Capsule().strokeBorder(tint.opacity(0.25), lineWidth: 0.8))
         .help(ok ? "已获得键盘接管权限" : "系统设置 → 隐私与安全性 → 辅助功能，勾选本 App")
     }
 
@@ -606,61 +687,169 @@ struct ContentView: View {
 
     /// 主机开机自检时链路还没连上，客户端发不出任何按键，
     /// 所以让固件自己在 USB 枚举完成后连发这个键，覆盖整个 POST 窗口。
+    ///
+    /// 键位从「一个分段控件」换成了网格：分段控件塞不下 F1~F12 全键
+    /// （NSSegmentedControl 不会压缩段内文字，段一多就互相叠着挤出边界）。
+    /// 网格还有个好处：点一下只是「选中」，真正写进固件要再按一次按钮，不会误触。
     private var bootCard: some View {
-        Card(title: "BIOS 启动键（板子自己连发，不依赖连接）", icon: "power") {
-            VStack(alignment: .leading, spacing: 8) {
-                // 分段控件独占一行，且**不要写死宽度**：
-                // NSSegmentedControl 不会压缩段内文字，宽度不够时它按自然宽度排版、
-                // 左右均摊溢出，于是首段顶出卡片边界、相邻段互相叠在一起。
-                // 8 段（Del/F2/F10/F12/F1/F8/Esc/关闭）实测自然宽 400pt，
-                // 窗口最窄 840（内容区 786）时余量约 370pt，不会再挤。
-                VStack(alignment: .leading, spacing: 8) {
-                    Picker("", selection: ui.biosKeyBinding) {
-                        ForEach(Layout.biosKeys, id: \.token) { item in
-                            Text(item.label).tag(item.token)
+        Card(title: "BIOS 启动键（板子自己连发，不依赖连接）", icon: "power",
+             expanded: ui.expanded("bios"),
+             summary: ui.biosKey == "off"
+                 ? "已关闭"
+                 : "\(ui.biosKey.uppercased()) · \(ui.bootWindowMs / 1000) 秒 / \(ui.bootGapValue)ms") {
+            VStack(alignment: .leading, spacing: 10) {
+                // 左右两栏：左边是键帽方阵，右边是连发节奏 + 操作按钮。
+                // 卡片是整窗宽（≥1000pt），只放一排键的话右边会空掉半张卡；
+                // 键帽又必须定宽（见下面 GridItem 那段），所以把控件挪到右边来填。
+                HStack(alignment: .top, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        // 固定列宽，不跟着窗口拉伸。这一列卡片是整窗宽（≥1000pt），
+                        // 8 个弹性列每个会被撑到 100pt 以上，一排又宽又扁的大砖头，
+                        // 看着像主按钮而不是键帽。定宽 52 之后 F1~F12 就是一个紧凑键盘块。
+                        LazyVGrid(columns: Array(repeating: GridItem(.fixed(52), spacing: 6),
+                                                 count: 8),
+                                  alignment: .leading, spacing: 6) {
+                            ForEach(Layout.biosKeys, id: \.token) { item in
+                                biosChip(label: item.label, token: item.token)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        Text(bootFooter)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(Color.secondary)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: 456, alignment: .leading)
+                    }
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        // 连发节奏：这两项最终写进固件的 NVS，掉电保持
+                        HStack(spacing: 12) {
+                            numberField(title: "连发时长", unit: "秒",
+                                        binding: ui.bootWindowBinding,
+                                        range: 1...60, step: 1)
+                            numberField(title: "连发间隔", unit: "ms",
+                                        binding: ui.bootGapBinding,
+                                        range: 60...5000, step: 20)
+                        }
+
+                        Text("每 \(ui.bootGapValue)ms 敲一次，持续 \(ui.bootWindowMs / 1000) 秒")
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(Color.secondary)
+                            .lineLimit(1)
+
+                        HStack(spacing: 8) {
+                            Button("写入固件") {
+                                bridge.send(Command.bootKey(ui.biosKey))
+                                bridge.send(Command.bootKeyWindow(ui.bootWindowMs))
+                                bridge.send(Command.bootKeyGap(ui.bootGapValue))
+                                // 把「这次写了什么」记进日志：出问题时对照固件回执，
+                                // 一眼就能看出是没写进去还是被写的值就不对
+                                bridge.log("写入固件：\(ui.biosKey) · "
+                                    + "\(ui.bootWindowMs / 1000) 秒 / \(ui.bootGapValue)ms")
+                            }
+                            .buttonStyle(.bordered)
+                            .help("把键位和连发节奏一起写进板子的 NVS，掉电保持；以后每次上电都按这套走")
+
+                            Button("立即连发") {
+                                // 一次带上参数：少一次往返，也不会有「按了立即连发但用的是旧值」的错觉
+                                bridge.send(Command.bootKeyNow(windowMs: ui.bootWindowMs,
+                                                               gapMs: ui.bootGapValue))
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .help("让板子马上按上面的节奏再连发一轮（已经开着机、想再敲一次时用）")
+
+                            Button("查询当前设置") {
+                                bridge.send(Command.bootKeyQuery)
+                            }
+                            .buttonStyle(.link)
+                            .font(.system(size: 10.5))
                         }
                     }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                    HStack(spacing: 8) {
-                        Button("写入固件") {
-                            bridge.send(Command.bootKey(ui.biosKey))
-                        }
-                        .buttonStyle(.bordered)
-                        .help("写进板子的 NVS，掉电保持；以后每次上电都会连发这个键")
-
-                        Button("立即连发") {
-                            bridge.send(Command.bootKeyNow)
-                        }
-                        .buttonStyle(.bordered)
-                        .help("让板子马上再连发一轮（已经开着机、想再敲一次时用）")
-
-                        Button("查询当前设置") {
-                            bridge.send(Command.bootKeyQuery)
-                        }
-                        .buttonStyle(.link)
-                        .font(.system(size: 10.5))
-
-                        Spacer(minLength: 0)
-                    }
+                    Spacer(minLength: 0)
                 }
-                .disabled(!bridge.state.isConnected)
-
-                Text("上电后约 1.5 秒开始，每 220ms 敲一次，持续 15 秒（单次按下 80ms，照顾 UEFI 的慢轮询）。写一次就一直有效，不用每次开机都开客户端。")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(Color.secondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
             }
+            .disabled(!bridge.state.isConnected)
+            // 固件回报了真值就同步到控件上：以固件为准，客户端不自作主张
+            .onChange(of: bridge.bootConfig) { _, cfg in
+                guard let cfg, cfg.windowMs > 0 else { return }
+                ui.biosKey = cfg.key
+                ui.bootWindowSeconds = Double(cfg.windowMs) / 1000
+                ui.bootGapMs = Double(cfg.gapMs)
+            }
+        }
+    }
+
+    private var bootFooter: String {
+        var text = "上电后约 1.5 秒开始，按上面的节奏连发（单次按下 80ms，照顾 UEFI 的慢轮询）。"
+            + "写一次就一直有效，不用每次开机都开客户端。"
+        if let cfg = bridge.bootConfig {
+            text += " " + cfg.summary
+        }
+        return text
+    }
+
+    /// BIOS 键位小方块：选中态用强调色描边 + 淡底
+    private func biosChip(label: String, token: String) -> some View {
+        let selected = ui.biosKey == token
+        return Button {
+            ui.biosKey = token
+        } label: {
+            Text(label)
+                .font(.system(size: 11, weight: selected ? .semibold : .regular))
+                .frame(maxWidth: .infinity)
+                .frame(height: 23)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(selected ? Palette.brand : Palette.title.opacity(0.85))
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(
+                    selected
+                    ? AnyShapeStyle(LinearGradient(
+                        colors: [Palette.brand.opacity(0.18), Palette.brandAlt.opacity(0.14)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing))
+                    : AnyShapeStyle(Palette.keyFill)
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(selected ? Palette.brand.opacity(0.55) : Palette.keyStroke,
+                              lineWidth: selected ? 1.2 : 1)
+        )
+        .help(token == "off" ? "关掉开机连发：板子不再自己敲键"
+                             : "开机时让板子连发 \(label)")
+    }
+
+    /// 「数字 + 单位 + 步进」的小控件。不用写死宽度的输入框，避免数字一变布局就跳
+    private func numberField(title: String, unit: String, binding: Binding<Double>,
+                             range: ClosedRange<Double>, step: Double) -> some View {
+        HStack(spacing: 5) {
+            Text(title)
+                .font(.system(size: 10.5))
+                .foregroundStyle(Color.secondary)
+            TextField("", value: binding, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 54)
+                .labelsHidden()
+            Text(unit)
+                .font(.system(size: 10.5))
+                .foregroundStyle(Color.secondary)
+            Stepper("", value: binding, in: range, step: step)
+                .labelsHidden()
+                .controlSize(.small)
         }
     }
 
     // MARK: - 文字
 
     private var textCard: some View {
-        Card(title: "文字", icon: "text.cursor") {
+        Card(title: "文字", icon: "text.cursor", expanded: ui.expanded("text"),
+             summary: ui.text.isEmpty ? "未输入" : ui.text) {
             HStack(spacing: 8) {
                 TextField("要输入的文字", text: ui.textBinding)
                     .textFieldStyle(.roundedBorder)
@@ -686,19 +875,15 @@ struct ContentView: View {
     // MARK: - 快捷键
 
     private var presetsCard: some View {
-        Card(title: "常用快捷键", icon: "command") {
+        Card(title: "常用快捷键", icon: "command", expanded: ui.expanded("presets"),
+             summary: ui.presetOS.rawValue + " 预设") {
             VStack(alignment: .leading, spacing: 9) {
                 HStack(spacing: 8) {
-                    Picker("", selection: ui.presetOSBinding) {
-                        ForEach(PresetOS.allCases) { os in
-                            Text(os.rawValue).tag(os)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    // 别写死宽度：实测 2 段「Windows / macOS」的自然宽是 158pt，
-                    // 给 150 会把控件压扁、双向溢出 4pt，文字贴到分隔线上。
-                    .fixedSize()
+                    BrandSegmented(
+                        options: PresetOS.allCases.map { (label: $0.rawValue, value: $0) },
+                        selection: ui.presetOSBinding,
+                        segmentWidth: 54
+                    )
 
                     Text(ui.presetOS == .windows
                          ? "⌘ 就是 Win 键：⌘Space = Win+Space（切输入法）"
@@ -749,21 +934,22 @@ struct ContentView: View {
                 }
                 .background(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .fill(Color(nsColor: .textBackgroundColor).opacity(0.55))
+                        .fill(Palette.well)
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: 9, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.09))
+                        .strokeBorder(Palette.wellStroke)
                         .allowsHitTesting(false)
                 )
                 .overlay(
                     VStack(spacing: 3) {
                         Image(systemName: "hand.point.up.left.fill")
                             .font(.system(size: 15))
+                            .foregroundStyle(Palette.brand.opacity(0.55))
                         Text("按住拖动，指针跟着走")
                             .font(.system(size: 10.5))
+                            .foregroundStyle(Color.secondary)
                     }
-                    .foregroundStyle(Color.secondary)
                     .allowsHitTesting(false)
                 )
                 .frame(minHeight: 84, maxHeight: .infinity)
@@ -789,6 +975,7 @@ struct ContentView: View {
                         .foregroundStyle(Color.secondary)
                     Slider(value: ui.mouseSpeedBinding, in: 0.5...4, step: 0.1)
                         .controlSize(.mini)
+                        .tint(Palette.brandButton)
                     Text(String(format: "%.1f×", ui.mouseSpeed))
                         .font(.system(size: 10.5, design: .monospaced))
                         .foregroundStyle(Color.secondary)
@@ -806,16 +993,19 @@ struct ContentView: View {
         let held = ui.mouseHeld.contains(name)
         return ZStack {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(held ? Color.accentColor : Color(nsColor: .controlBackgroundColor))
+                .fill(held
+                      ? AnyShapeStyle(Palette.brandGradientTL)
+                      : AnyShapeStyle(Palette.keyFill))
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(Color.primary.opacity(held ? 0 : 0.12))
+                .strokeBorder(held ? Color.clear : Palette.keyStroke)
             Text(label)
                 .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(held ? Color.white : Color.primary)
+                .foregroundStyle(held ? Palette.onBrand : Palette.title)
                 .allowsHitTesting(false)
             PressCatcher(onPress: { ui.pressMouse(name) },
                          onRelease: { ui.releaseMouse(name) })
         }
+        .shadow(color: held ? Palette.brand.opacity(0.35) : .clear, radius: 3, y: 1)
         .frame(height: 26)
         .help("按住不松 = 主机上一直按着；快速点一下 = 单击")
     }
@@ -848,7 +1038,7 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
-            .tint(.orange)
+            .tint(Palette.warnButton)
             .controlSize(.small)
             .help("主机左键正被按住，拖拖拽区就是拖拽；点这里松开")
         } else {
@@ -899,13 +1089,17 @@ struct ContentView: View {
         .buttonStyle(.plain)
         .background(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(active ? Color.accentColor : Color(nsColor: .controlBackgroundColor))
+                .fill(active
+                      ? AnyShapeStyle(Palette.brandGradientTL)
+                      : AnyShapeStyle(Palette.keyFill))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(Color.primary.opacity(active ? 0 : 0.12))
+                .strokeBorder(active ? Color.clear : Palette.keyStroke)
         )
-        .foregroundStyle(active ? Color.white : Color.primary)
+        // 高亮那 120ms 带一圈同色光晕，肉眼更容易捕捉到「这一下发出去了」
+        .shadow(color: active ? Palette.brand.opacity(0.40) : .clear, radius: 3, y: 1)
+        .foregroundStyle(active ? Palette.onBrand : Palette.title)
     }
 
     private func press(_ token: String) {
@@ -964,9 +1158,9 @@ struct ContentView: View {
                     ForEach(bridge.logs.suffix(120)) { entry in
                         HStack(alignment: .top, spacing: 6) {
                             Text(Self.timeFormatter.string(from: entry.time))
-                                .foregroundStyle(Color.secondary.opacity(0.6))
+                                .foregroundStyle(Color.secondary.opacity(0.55))
                             Text(entry.text)
-                                .foregroundStyle(entry.isError ? Color.red : Color.secondary)
+                                .foregroundStyle(entry.isError ? Palette.danger : Color.secondary)
                         }
                         .font(.system(size: 10.5, design: .monospaced))
                         .id(entry.id)
@@ -977,7 +1171,7 @@ struct ContentView: View {
                 .padding(.vertical, 8)
             }
             .frame(height: 86)
-            .background(Color(nsColor: .underPageBackgroundColor).opacity(0.5))
+            .background(Palette.well)
             .onChange(of: bridge.logs.count) { _, _ in
                 if let last = bridge.logs.last {
                     withAnimation(.easeOut(duration: 0.15)) {
@@ -1008,8 +1202,9 @@ struct SpinningArc: View {
                 .truncatingRemainder(dividingBy: period) / period
             Circle()
                 .trim(from: 0, to: 0.68)
-                .stroke(style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
-                .foregroundStyle(Color.orange)
+                // 描边直接吃渐变：转起来是青 → 紫的一段弧，比单色更有「在跑」的感觉
+                .stroke(Palette.brandGradientTL,
+                        style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
                 .rotationEffect(.degrees(phase * 360))
         }
         .frame(width: 11, height: 11)
@@ -1023,34 +1218,81 @@ struct Card<Content: View>: View {
     let icon: String
     /// true 时卡片会撑满父视图给的高度（并排等高就差这个），多出来的空间交给内容里的可伸缩视图
     let fillHeight: Bool
+    /// nil = 不可折叠；给了绑定就点标题栏收起/展开
+    let expanded: Binding<Bool>?
+    /// 收起时显示在标题右边的一句话概要，免得「折叠 = 什么都看不见」
+    let summary: String?
     let content: Content
 
     init(title: String, icon: String, fillHeight: Bool = false,
+         expanded: Binding<Bool>? = nil, summary: String? = nil,
          @ViewBuilder content: () -> Content) {
         self.title = title
         self.icon = icon
         self.fillHeight = fillHeight
+        self.expanded = expanded
+        self.summary = summary
         self.content = content()
     }
 
+    private var isExpanded: Bool { expanded?.wrappedValue ?? true }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label(title, systemImage: icon)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.secondary)
-            content
+            header
+            // 收起来时直接把内容从视图树里摘掉（不是 opacity 0），
+            // 这样卡片高度会真的缩回去，否则「折叠」省不了任何地方
+            if isExpanded {
+                content
+            }
         }
         .padding(13)
         .frame(maxWidth: .infinity,
                maxHeight: fillHeight ? .infinity : nil,
                alignment: .topLeading)
-        .background(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 13, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.07))
-        )
+        // 渐变底 + 青紫微光 + 细描边 + 柔和投影，统一由 Theme.swift 提供
+        .cardSurface(cornerRadius: 14)
+    }
+
+    /// 标题栏。可折叠时整条都能点，右边带一个小箭头表示状态
+    private var header: some View {
+        HStack(spacing: 5) {
+            // 图标单独上品牌色：整个 Label 一起改色会连标题文字也染色，太吵
+            Image(systemName: icon)
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundStyle(isExpanded ? Palette.brand : Palette.brand.opacity(0.65))
+                .frame(width: 13, alignment: .leading)
+
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Palette.title.opacity(0.72))
+                .lineLimit(1)
+                .layoutPriority(1)
+
+            if !isExpanded, let summary, !summary.isEmpty {
+                Text(summary)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(Color.secondary.opacity(0.7))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.leading, 2)
+            }
+
+            Spacer(minLength: 0)
+            if expanded != nil {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(isExpanded ? Palette.brandAlt.opacity(0.85)
+                                                : Color.secondary.opacity(0.55))
+                    .rotationEffect(.degrees(isExpanded ? 0 : -90))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard let expanded else { return }
+            withAnimation(.easeInOut(duration: 0.16)) { expanded.wrappedValue.toggle() }
+        }
+        .help(expanded == nil ? title : "点一下收起 / 展开")
     }
 }

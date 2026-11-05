@@ -39,3 +39,6 @@ venv/
 # 本地证书与私钥，不要外传
 *.p12
 *.cer
+
+# 上次构建用的签名身份（build.sh 自动写，用来判断要不要重新授权）
+mac_swift/.sign-identity

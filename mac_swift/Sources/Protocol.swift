@@ -35,6 +35,14 @@ enum Command {
     static let bootKeyQuery = "BOOTKEY:?"
     /// 立刻重来一轮连发（用于已经进了 BIOS 界面但还想敲一次）
     static let bootKeyNow = "BOOTKEY:now"
+    /// 立刻连发，并顺手把时长/间隔写进固件（一次往返，少一次竞态）
+    static func bootKeyNow(windowMs: Int, gapMs: Int) -> String {
+        "BOOTKEY:now \(windowMs) \(gapMs)"
+    }
+    /// 连发时长：开机后连发多久（固件会夹到 1000~60000ms）
+    static func bootKeyWindow(_ ms: Int) -> String { "BOOTKEY:window \(ms)" }
+    /// 连发间隔：每两下之间隔多久（固件会夹到 60~5000ms）
+    static func bootKeyGap(_ ms: Int) -> String { "BOOTKEY:gap \(ms)" }
 
     // MARK: - 鼠标
     //
@@ -54,6 +62,22 @@ enum Command {
     static func mouseClick(_ button: String) -> String { "MOUSE:click \(button)" }
     /// 松开所有鼠标键
     static let mouseRelease = "MOUSE:release"
+}
+
+/// 固件回报的引导键参数，来自 `BOOTCFG:key=delete,win=10000,gap=220,hold=80`
+struct BootConfig: Equatable {
+    var key: String        // 键名，off = 已关闭
+    var windowMs: Int      // 连发时长
+    var gapMs: Int         // 连发间隔
+    var holdMs: Int        // 单次按下保持（固件固定 80ms，仅供显示）
+
+    var windowSeconds: Double { Double(windowMs) / 1000 }
+
+    /// 一句话概括，卡片底部那行灰字用
+    var summary: String {
+        let name = key == "off" ? "已关闭" : key.uppercased()
+        return "固件当前：\(name) · 时长 \(windowMs / 1000) 秒 · 间隔 \(gapMs)ms · 单次按下 \(holdMs)ms"
+    }
 }
 
 /// Mac 虚拟键码（kVK_*）→ 协议键名。
@@ -230,9 +254,16 @@ enum Layout {
     ]
 
     /// BIOS / UEFI 启动键。客户端可以把它写进固件，让板子在上电后自己连发。
+    ///
+    /// 各家主板的「按 X 进设置」并不统一：技嘉/微星多是 Del，华硕/联想多是 F2，
+    /// 品牌整机还可能是 F10 / F12 / Esc，个别工控板是 F1 / F8。
+    /// 所以 F1~F12 全给出来，别让人因为一个键不对就以为功能坏了。
     static let biosKeys: [(label: String, token: String)] = [
-        ("Del", "delete"), ("F2", "f2"), ("F10", "f10"), ("F12", "f12"),
-        ("F1", "f1"), ("F8", "f8"), ("Esc", "esc"), ("关闭", "off"),
+        ("Del", "delete"), ("Esc", "esc"),
+        ("F1", "f1"), ("F2", "f2"), ("F3", "f3"), ("F4", "f4"),
+        ("F5", "f5"), ("F6", "f6"), ("F7", "f7"), ("F8", "f8"),
+        ("F9", "f9"), ("F10", "f10"), ("F11", "f11"), ("F12", "f12"),
+        ("关闭", "off"),
     ]
 
     private static func k(_ label: String, _ token: String? = nil) -> KeyDef {

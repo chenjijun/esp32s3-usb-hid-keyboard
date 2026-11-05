@@ -9,6 +9,11 @@
  *    1) BLE 外设：对外广播 "ESP32-Keyboard"，提供一个可写入的特征用于收命令
  *    2) USB HID 键盘：插在主机上，把收到的命令变成真实按键
  *
+ *  板载 RGB 灯（默认 GPIO48）有两层意思：
+ *    底色  = 链路状态：蓝/紫 = BLE 未连/已连，绿/黄 = Wi-Fi 未连/已连
+ *    白闪  = 指令回执：每执行完一条命令闪一下，闪几下由命令长度决定
+ *            （短按 1 下、长文本 6 下，阈值见 LED_CMD_* 宏）
+ *
  *  Arduino IDE 板卡设置（必须）：
  *    开发板        : ESP32S3 Dev Module
  *    USB Mode      : USB-OTG (TinyUSB)     <-- 关键，否则 USBHIDKeyboard 不可用
@@ -540,6 +545,24 @@ static const uint8_t LED_BLE_READY[3]  = {150, 0, 255};
 static const uint8_t LED_WIFI_IDLE[3]  = {0, 170, 0};
 static const uint8_t LED_WIFI_READY[3] = {255, 170, 0};
 
+// 指令闪灯：每执行完一条协议命令白闪一下，闪几下由命令长度决定。
+// 用途是「不看屏幕也知道命令进去了没有、这一条有多大」——尤其是手机端发长文本、
+// 或者主机画面被全屏盖住的时候，灯是唯一还看得见的反馈。
+//   1~8 字节    1 下   TAP:q / RELEASEALL
+//   9~32 字节   2 下   MOUSE:click right / BOOTKEY:f2
+//   33~128 字节 3 下   TYPE:hi there
+//   129~512 字节 4 下  一句话
+//   513~1024 字节 5 下 一段话
+//   > 1024 字节 6 下   一次粘一大坨
+// 白闪和蓝/紫/绿/黄四种状态色都不撞，闪的时候不会误认成链路状态变了。
+// PING 心跳不闪（客户端每 10 秒一次，闪起来像故障）；MOUSE:move / MOUSE:wheel 也不闪，
+// 那是 30Hz 攒批发的流，同样会闪成坏灯。想彻底关掉就把 LED_CMD_FLASH 设 0。
+#define LED_CMD_FLASH       1
+#define LED_CMD_ON_MS       45     // 每下亮多久
+#define LED_CMD_GAP_MS      55     // 两下之间灭多久（灭的时候露出链路底色，闪起来才像「闪」）
+#define LED_CMD_MAX_BLINKS  6      // 一次最多连闪几下，长文本别闪成迪斯科
+static const uint8_t LED_CMD_COLOR[3] = {255, 255, 255};
+
 // 按键保持时间。
 // USB HID 键盘一般 8~10ms 轮询一次，Windows 收到 15ms 的按下-抬起没问题；
 // 但 BIOS/UEFI 的轮询更慢（有的到 16ms），太短会整次按键都采不到，
@@ -560,12 +583,22 @@ static const uint16_t COMBO_HOLD_MS = 40;
 //   · 改这里的 BOOTKEY_DEFAULT（默认 delete，也就是 BIOS 里那个 Del）
 //   · 或者发 BOOTKEY:f2 / BOOTKEY:off 命令，会写进 NVS，掉电保持
 //   · BOOTKEY:now 立即重来一轮（客户端上的「立即连发」）
+//   · BOOTKEY:window <ms> / BOOTKEY:gap <ms> 改连发时长和间隔，同样写 NVS
+//     （客户端上那两个输入框就是发这个；下面两个宏只是出厂默认值）
 #define BOOTKEY_DEFAULT     KT_KEY_DELETE
 #define BOOTKEY_ENABLED     1
 #define BOOTKEY_HOLD_MS     80      // 单次按下保持，给 UEFI 的慢轮询留余量
-#define BOOTKEY_GAP_MS      220     // 两次连发之间
-#define BOOTKEY_WINDOW_MS   10000   // 开机后连发多久（覆盖 POST 的 "按 Del 进设置" 窗口）
+#define BOOTKEY_GAP_MS      220     // 两次连发之间的默认间隔
+#define BOOTKEY_WINDOW_MS   10000   // 开机后连发多久的默认值（覆盖 POST 的 "按 Del 进设置" 窗口）
 #define BOOTKEY_START_MS    1500    // 上电后等 USB 枚举完成再开始
+
+// 运行时可调范围。给上下限是为了挡住手抖和脚本 bug：
+// 窗口 1~60 秒、间隔 60~5000ms；间隔再小会变成一直按着不放，
+// 主机那边反而采不到；再大就错过 POST 窗口了。
+#define BOOTKEY_WINDOW_MIN_MS   1000
+#define BOOTKEY_WINDOW_MAX_MS   60000
+#define BOOTKEY_GAP_MIN_MS      60
+#define BOOTKEY_GAP_MAX_MS      5000
 // 只在上电（冷启动）时连发。重新烧录、按板子上的复位键都不触发，
 // 免得连着正在跑的 Windows 时突然刷一串 Del 把人家文档删了。
 // 判断依据是 esp_reset_reason()：只有真断电再来电才是 ESP_RST_POWERON。
@@ -632,6 +665,8 @@ String rxLine;  // BLE 的收包缓冲，只在 BLE 任务中访问
 
 // ---------------------------- 状态灯 ----------------------------------------
 static uint8_t ledLast[3] = {255, 255, 255};
+static uint8_t ledBase[3] = {0, 0, 0};      // 链路状态色，指令闪灯熄灭时回落到这里
+static const uint8_t LED_OFF[3] = {0, 0, 0};  // 全灭
 
 // 按 LED_BRIGHTNESS 缩放单个通道（四舍五入）。
 // 所有真正写灯的地方都过一遍这里，改亮度只要改上面那一个宏。
@@ -654,13 +689,86 @@ static void ledSet(const uint8_t c[3]) {
 #endif
 }
 
-// 蓝/紫 = 蓝牙模式，绿/黄 = WiFi 模式，亮/暗（紫、黄）= 未连接/已连接
-static void ledRefresh() {
-  bool ready = deviceConnected;
-  if (linkMode == MODE_BLE) {
-    ledSet(ready ? LED_BLE_READY : LED_BLE_IDLE);
+// ---- 指令闪灯（非阻塞状态机）-----------------------------------------------
+// 为什么不直接在 processCommand 里 delay 着闪：那条路径上有大段 delay（按键保持
+// 24ms、逐字输入的字间隔、鼠标 click 的 40ms、连发引导键的 220ms），在里面再
+// 阻塞闪灯，命令会越排越后，鼠标都会变卡。所以只在这里改状态，由 loop() 每
+// 2ms 调一次 ledFlashTick() 推进。
+static uint8_t  flashLeft = 0;   // 还要闪几下（当前正亮着的那一下算在内）
+static bool     flashLit  = false;
+static uint32_t flashAt   = 0;   // 下一次切换颜色的时刻
+
+static inline bool ledFlashActive() {
+  return flashLit || flashLeft > 0;
+}
+
+// 命令长度 -> 闪烁次数
+static inline uint8_t ledFlashBlinks(size_t bytes) {
+  if (bytes > 1024) return 6;
+  if (bytes > 512)  return 5;
+  if (bytes > 128)  return 4;
+  if (bytes > 32)   return 3;
+  if (bytes > 8)    return 2;
+  return 1;
+}
+
+// 每执行完一条命令调用一次。连续来的命令不打断当前这一下，而是往后排队
+// （有 LED_CMD_MAX_BLINKS 上限），所以按住方向键连发时看到的是「有节奏地一直闪」，
+// 而不是被压成常亮或者闪得看不清。
+static void ledFlashCommand(size_t bytes) {
+#if LED_CMD_FLASH && LED_USE_RGB
+  uint16_t want = (uint16_t)flashLeft + (uint16_t)ledFlashBlinks(bytes);
+  flashLeft = (want > LED_CMD_MAX_BLINKS) ? (uint8_t)LED_CMD_MAX_BLINKS : (uint8_t)want;
+  if (!flashLit) {
+    flashLit = true;
+    flashAt = millis() + LED_CMD_ON_MS;
+    ledSet(LED_CMD_COLOR);
+  }
+#else
+  (void)bytes;
+#endif
+}
+
+// 推进闪灯。必须在 loop() 里勤着调，但也别在 delay 里调（会跟主循环抢时序）。
+static void ledFlashTick() {
+#if LED_CMD_FLASH && LED_USE_RGB
+  if (!ledFlashActive()) {
+    return;
+  }
+  uint32_t now = millis();
+  // 用有符号差值比较，millis() 49 天回绕也不会卡死
+  if ((int32_t)(now - flashAt) < 0) {
+    return;  // 还没到切换点
+  }
+
+  if (flashLit) {
+    flashLit = false;
+    if (flashLeft > 0) {
+      flashLeft--;
+    }
+    if (flashLeft == 0) {
+      ledSet(ledBase);  // 闪完了，回到底色
+    } else {
+      ledSet(LED_OFF);  // 灭一下，这一明一暗才算「闪」
+      flashAt = now + LED_CMD_GAP_MS;
+    }
   } else {
-    ledSet(ready ? LED_WIFI_READY : LED_WIFI_IDLE);
+    flashLit = true;
+    ledSet(LED_CMD_COLOR);
+    flashAt = now + LED_CMD_ON_MS;
+  }
+#endif
+}
+
+// 蓝/紫 = 蓝牙模式，绿/黄 = WiFi 模式，亮/暗（紫、黄）= 未连接/已连接
+// 这里只更新「底色」：正在闪灯时不抢写，等闪完由 ledFlashTick() 自己回到底色。
+static void ledRefresh() {
+  const uint8_t *want = (linkMode == MODE_BLE)
+                            ? (deviceConnected ? LED_BLE_READY : LED_BLE_IDLE)
+                            : (deviceConnected ? LED_WIFI_READY : LED_WIFI_IDLE);
+  memcpy(ledBase, want, 3);
+  if (!ledFlashActive()) {
+    ledSet(ledBase);
   }
 }
 
@@ -800,6 +908,22 @@ static uint8_t bootKeyCode = BOOTKEY_ENABLED ? (uint8_t)BOOTKEY_DEFAULT : 0;
 static uint32_t bootKeyNextAt = 0;   // 下一次该按的时间点
 static uint32_t bootKeyEndAt = 0;    // 连发窗口的截止时间，0 表示没在跑
 
+// 连发时长 / 间隔：出厂用宏，客户端可以改（存 NVS，掉电保持）
+static uint16_t bootKeyWindowMs = BOOTKEY_WINDOW_MS;
+static uint16_t bootKeyGapMs = BOOTKEY_GAP_MS;
+
+static uint16_t bootKeyClampWindow(long v) {
+  if (v < BOOTKEY_WINDOW_MIN_MS) return BOOTKEY_WINDOW_MIN_MS;
+  if (v > BOOTKEY_WINDOW_MAX_MS) return BOOTKEY_WINDOW_MAX_MS;
+  return (uint16_t)v;
+}
+
+static uint16_t bootKeyClampGap(long v) {
+  if (v < BOOTKEY_GAP_MIN_MS) return BOOTKEY_GAP_MIN_MS;
+  if (v > BOOTKEY_GAP_MAX_MS) return BOOTKEY_GAP_MAX_MS;
+  return (uint16_t)v;
+}
+
 static void bootKeyBeginWindow(uint32_t windowMs) {
   if (bootKeyCode == 0) {
     bootKeyEndAt = 0;
@@ -811,6 +935,49 @@ static void bootKeyBeginWindow(uint32_t windowMs) {
 
 static void bootKeyStop() {
   bootKeyEndAt = 0;
+}
+
+// 前置声明：下面恢复/保存要打日志，用到 bootKeyName()
+static const char *bootKeyName();
+
+// 把引导键写进 NVS，写完立刻回读比对。
+//
+// 为什么要这么较真：NVS 写失败（分区满、只读、掉电时序）在串口里几乎看不出来，
+// 表现却是最难查的那种——「设了关闭，下次开机照样敲键」。与其让用户对着界面
+// 猜，不如写完就验一次，不一致直接把话挑明。
+static bool bootKeySaveCode(uint8_t code) {
+  prefs.begin("kbd", false);
+  prefs.putUChar("bootkey", code);
+  uint8_t back = prefs.getUChar("bootkey", 0xFF);
+  prefs.end();
+  return back == code;
+}
+
+// 开机从 NVS 恢复引导键设置。
+//
+// isKey 用来区分「从没设置过」和「设置成关闭（0）」：前者按出厂宏走 delete，
+// 后者是真的关掉，开机一下都不许敲。这两件事一旦混在一起（比如用 -1 当默认值），
+// 就会出现「关了还在敲」或者「没设过却不敲」。顺手把时长/间隔也夹一次范围，
+// 万一 NVS 里是脏值，别让连发跑飞。
+static void bootKeyLoadSaved() {
+  prefs.begin("kbd", true);
+  bool hasBoot = prefs.isKey("bootkey");
+  uint8_t savedBoot = hasBoot ? prefs.getUChar("bootkey", 0) : 0;
+  uint16_t savedWin = prefs.getUShort("bkwin", BOOTKEY_WINDOW_MS);
+  uint16_t savedGap = prefs.getUShort("bkgap", BOOTKEY_GAP_MS);
+  prefs.end();
+
+  if (hasBoot) {
+    bootKeyCode = savedBoot;
+  } else {
+    bootKeyCode = BOOTKEY_ENABLED ? (uint8_t)BOOTKEY_DEFAULT : 0;
+  }
+  bootKeyWindowMs = bootKeyClampWindow(savedWin);
+  bootKeyGapMs = bootKeyClampGap(savedGap);
+
+  Serial.printf("[BOOTKEY] NVS 恢复：%s（%s），时长 %u ms、间隔 %u ms\n",
+                bootKeyName(), hasBoot ? "有记录" : "没记录，用出厂默认",
+                (unsigned)bootKeyWindowMs, (unsigned)bootKeyGapMs);
 }
 
 // 返回当前引导键的名字，用于回执
@@ -839,7 +1006,7 @@ static void serviceBootKey() {
   if ((int32_t)(now - bootKeyNextAt) < 0) {
     return;
   }
-  bootKeyNextAt = now + BOOTKEY_GAP_MS;
+  bootKeyNextAt = now + bootKeyGapMs;
   tapCode(bootKeyCode, BOOTKEY_HOLD_MS);
 }
 
@@ -859,6 +1026,18 @@ static void notifyHost(const String &msg) {
   }
 }
 
+// 引导键的完整状态回执。为什么单独一条而不是塞进 BOOTKEY:：
+// 老客户端把 "BOOTKEY:" 后面整段都当键名（Flutter / Python 都是这么解析的），
+// 多几个字段就会显示成乱码。所以另开一条 BOOTCFG:，老客户端只会把它当未知回执。
+//   BOOTCFG:key=delete,win=10000,gap=220,hold=80
+static void notifyBootCfg() {
+  String msg = String("BOOTCFG:key=") + bootKeyName() +
+               ",win=" + String((unsigned)bootKeyWindowMs) +
+               ",gap=" + String((unsigned)bootKeyGapMs) +
+               ",hold=" + String((unsigned)BOOTKEY_HOLD_MS);
+  notifyHost(msg);
+}
+
 // 把一行协议文本塞进执行队列（BLE 回调、WiFi 收包共用）
 static void pushCommand(const String &line) {
   if (line.length() == 0) {
@@ -874,10 +1053,14 @@ static void pushCommand(const String &line) {
   xSemaphoreGive(queueMutex);
 }
 
-// BOOTKEY / BOOTKEY?            查询
-// BOOTKEY:off                   关掉开机连发
-// BOOTKEY:delete / f2 / f10 …   设置并写入 NVS（掉电保持）
-// BOOTKEY:now                   立刻重来一轮（不动配置）
+// BOOTKEY / BOOTKEY?              查询（回 BOOTKEY:<键> + BOOTCFG: 完整参数）
+// BOOTKEY:off                     关掉开机连发
+// BOOTKEY:delete / f2 / f10 …     设置并写入 NVS（掉电保持）
+// BOOTKEY:now [win] [gap]         立刻重来一轮；可顺手带上新参数
+// BOOTKEY:window <ms>             连发时长（1000~60000），写 NVS
+// BOOTKEY:gap <ms>                连发间隔（60~5000），写 NVS
+//
+// 参数两种写法都收：`BOOTKEY:window 8000` 和 `BOOTKEY:window=8000`。
 static void handleBootKeyCommand(const String &line) {
   String arg = line.substring(7);
   if (arg.startsWith(":")) {
@@ -885,8 +1068,85 @@ static void handleBootKeyCommand(const String &line) {
   }
   arg.trim();
 
-  if (arg.length() == 0 || arg == "?") {
+  // 拆出「动词 + 参数」：动词之后可能跟空格，也可能跟等号
+  String verb = arg;
+  String rest;
+  int sep = -1;
+  for (size_t i = 0; i < arg.length(); i++) {
+    char ch = arg[i];
+    if (ch == ' ' || ch == '=') {
+      sep = (int)i;
+      break;
+    }
+  }
+  if (sep >= 0) {
+    verb = arg.substring(0, (unsigned)sep);
+    rest = arg.substring((unsigned)sep + 1);
+    rest.trim();
+  }
+
+  if (verb.length() == 0 || verb == "?") {
     notifyHost(String("BOOTKEY:") + bootKeyName());
+    notifyBootCfg();
+    return;
+  }
+
+  // ---- 连发参数 ----
+  if (kt_eq(verb.c_str(), verb.length(), "window") || kt_eq(verb.c_str(), verb.length(), "win") ||
+      kt_eq(verb.c_str(), verb.length(), "duration")) {
+    if (rest.length() == 0) {
+      notifyBootCfg();
+      return;
+    }
+    uint16_t want = bootKeyClampWindow(rest.toInt());
+    bootKeyWindowMs = want;
+    prefs.begin("kbd", false);
+    prefs.putUShort("bkwin", want);
+    prefs.end();
+    Serial.printf("[BOOTKEY] 连发时长 %u ms\n", (unsigned)want);
+    notifyBootCfg();
+    return;
+  }
+
+  if (kt_eq(verb.c_str(), verb.length(), "gap") || kt_eq(verb.c_str(), verb.length(), "interval")) {
+    if (rest.length() == 0) {
+      notifyBootCfg();
+      return;
+    }
+    uint16_t want = bootKeyClampGap(rest.toInt());
+    bootKeyGapMs = want;
+    prefs.begin("kbd", false);
+    prefs.putUShort("bkgap", want);
+    prefs.end();
+    Serial.printf("[BOOTKEY] 连发间隔 %u ms\n", (unsigned)want);
+    notifyBootCfg();
+    return;
+  }
+
+  // ---- 立即连发：可以带 `now 8000 200` 顺手改参数 ----
+  if (kt_eq(verb.c_str(), verb.length(), "now")) {
+    if (rest.length() > 0) {
+      int sp = rest.indexOf(' ');
+      String w = sp < 0 ? rest : rest.substring(0, (unsigned)sp);
+      String g = sp < 0 ? String() : rest.substring((unsigned)sp + 1);
+      w.trim();
+      g.trim();
+      prefs.begin("kbd", false);
+      if (w.length() > 0) {
+        bootKeyWindowMs = bootKeyClampWindow(w.toInt());
+        prefs.putUShort("bkwin", bootKeyWindowMs);
+      }
+      if (g.length() > 0) {
+        bootKeyGapMs = bootKeyClampGap(g.toInt());
+        prefs.putUShort("bkgap", bootKeyGapMs);
+      }
+      prefs.end();
+    }
+    bootKeyBeginWindow(bootKeyWindowMs);
+    Serial.printf("[BOOTKEY] 立即连发 %s，时长 %u ms、间隔 %u ms\n", bootKeyName(),
+                  (unsigned)bootKeyWindowMs, (unsigned)bootKeyGapMs);
+    notifyHost(String("BOOTKEY:") + bootKeyName());
+    notifyBootCfg();
     return;
   }
 
@@ -894,18 +1154,13 @@ static void handleBootKeyCommand(const String &line) {
       kt_eq(arg.c_str(), arg.length(), "0")) {
     bootKeyCode = 0;
     bootKeyStop();
-    prefs.begin("kbd", false);
-    prefs.putUChar("bootkey", 0);
-    prefs.end();
-    Serial.println("[BOOTKEY] 已关闭");
+    bool saved = bootKeySaveCode(0);
+    Serial.printf("[BOOTKEY] 已关闭（NVS %s）\n", saved ? "已保存" : "写入失败");
+    if (!saved) {
+      notifyHost("[WARN] 引导键没写进 NVS（分区满或只读），重启后可能还会连发");
+    }
     notifyHost("BOOTKEY:off");
-    return;
-  }
-
-  if (kt_eq(arg.c_str(), arg.length(), "now")) {
-    bootKeyBeginWindow(BOOTKEY_WINDOW_MS);
-    Serial.printf("[BOOTKEY] 立即连发 %s\n", bootKeyName());
-    notifyHost(String("BOOTKEY:") + bootKeyName());
+    notifyBootCfg();
     return;
   }
 
@@ -915,12 +1170,15 @@ static void handleBootKeyCommand(const String &line) {
     return;
   }
   bootKeyCode = (uint8_t)code;
-  prefs.begin("kbd", false);
-  prefs.putUChar("bootkey", bootKeyCode);
-  prefs.end();
-  bootKeyBeginWindow(BOOTKEY_WINDOW_MS);
-  Serial.printf("[BOOTKEY] 设为 %s（已保存）\n", bootKeyName());
+  bool saved = bootKeySaveCode(bootKeyCode);
+  bootKeyBeginWindow(bootKeyWindowMs);
+  Serial.printf("[BOOTKEY] 设为 %s（NVS %s）\n", bootKeyName(),
+                saved ? "已保存" : "写入失败");
+  if (!saved) {
+    notifyHost("[WARN] 引导键没写进 NVS（分区满或只读），重启后可能回到旧设置");
+  }
   notifyHost(String("BOOTKEY:") + bootKeyName());
+  notifyBootCfg();
 }
 
 // ---------------------------- 鼠标 ------------------------------------------
@@ -1003,6 +1261,7 @@ static void handleMouseCommand(const String &line) {
     if (b) {
       mouseHeld |= b;
       Mouse.press(b);
+      ledFlashCommand(line.length());  // 鼠标键也闪：盲操时能确认「按下去了」
     }
     return;
   }
@@ -1012,6 +1271,7 @@ static void handleMouseCommand(const String &line) {
     if (b) {
       mouseHeld &= (uint8_t)~b;
       Mouse.release(b);
+      ledFlashCommand(line.length());
     }
     return;
   }
@@ -1022,12 +1282,14 @@ static void handleMouseCommand(const String &line) {
       Mouse.press(b);
       delay(MOUSE_CLICK_MS);
       Mouse.release(b);
+      ledFlashCommand(line.length());
     }
     return;
   }
 
   if (kt_eq(v, vl, "release") || kt_eq(v, vl, "releaseall")) {
     mouseReleaseAll();
+    ledFlashCommand(line.length());
     return;
   }
 
@@ -1045,10 +1307,13 @@ static void processCommand(const String &line) {
   // BOOTKEY 不属于按键协议（它改的是固件自己的配置），先截下来自己处理
   if (line.length() >= 7 && kt_eq(line.c_str(), 7, "bootkey")) {
     handleBootKeyCommand(line);
+    ledFlashCommand(line.length());
     return;
   }
 
   // 鼠标命令同理：它不是键码，走自己的解析（前缀 6 个字符 "MOUSE:"）
+  // 位移/滚轮不做指令闪灯（客户端 30Hz 攒批发，闪起来像坏灯），
+  // 只有按下/松开/单击/全松这种「一下是一下」的按键事件才闪，见 handleMouseCommand。
   if (line.length() >= 6 && kt_eq(line.c_str(), 6, "mouse:")) {
     handleMouseCommand(line);
     return;
@@ -1093,6 +1358,15 @@ static void processCommand(const String &line) {
       break;
     default:
       break;
+  }
+
+  // 指令执行完闪一下：长度决定闪几下（见文件顶部 LED_CMD_* 的说明）。
+  // 放在执行之后，因为闪灯是「这条命令已经出去了」的回执，不是「收到了」；
+  // 闪灯本身不阻塞，长文本打字期间它会被拖后，但节奏不乱。
+  // PING 是心跳（客户端每 10 秒一次），不算「指令」，不闪——否则灯会莫名其妙定期亮，
+  // 看起来像故障。
+  if (plan.action != KT_PING) {
+    ledFlashCommand(line.length());
   }
 }
 
@@ -1369,27 +1643,29 @@ void setup() {
 
   ledSelfTest();
 
-  // NVS：上次用的模式 + 开机引导键
+  // NVS：上次用的模式 + 开机引导键 + 连发时长/间隔
   prefs.begin("kbd", true);
   uint8_t saved = prefs.getUChar("mode", (uint8_t)MODE_BLE);
-  int savedBoot = prefs.getChar("bootkey", -1);
   prefs.end();
   linkMode = (saved == (uint8_t)MODE_WIFI) ? MODE_WIFI : MODE_BLE;
-  if (savedBoot >= 0) {
-    bootKeyCode = (uint8_t)savedBoot;
-  }
+  // 引导键一律以 NVS 为准：0 = 明确关闭（开机不敲），没有记录 = 出厂默认
+  bootKeyLoadSaved();
   Serial.printf("[MODE] 启动模式: %s（短按 BOOT 键切换）\n",
                 linkMode == MODE_BLE ? "BLE 蓝牙" : "WiFi 热点");
-  Serial.printf("[BOOTKEY] 开机连发: %s（BOOTKEY:off 可关）\n", bootKeyName());
+  Serial.printf("[BOOTKEY] 开机连发: %s，时长 %u ms、间隔 %u ms（BOOTKEY:off 可关）\n",
+                bootKeyName(), (unsigned)bootKeyWindowMs, (unsigned)bootKeyGapMs);
 
   setMode(linkMode, false);
 
   // 冷启动才开连发窗口：POST 阶段没有链路，只能靠固件自己敲键
   esp_reset_reason_t reason = esp_reset_reason();
   bool coldBoot = (reason == ESP_RST_POWERON || reason == ESP_RST_UNKNOWN);
-  if (coldBoot) {
-    bootKeyBeginWindow(BOOTKEY_WINDOW_MS);
-    Serial.printf("[BOOTKEY] 冷启动，开始连发 %s（约 %d 秒）\n", bootKeyName(), BOOTKEY_WINDOW_MS / 1000);
+  if (coldBoot && bootKeyCode != 0) {
+    bootKeyBeginWindow(bootKeyWindowMs);
+    Serial.printf("[BOOTKEY] 冷启动，开始连发 %s（约 %u 秒）\n", bootKeyName(),
+                  (unsigned)(bootKeyWindowMs / 1000));
+  } else if (coldBoot) {
+    Serial.println("[BOOTKEY] 引导键是「关闭」，冷启动也不敲键");
   } else {
     Serial.printf("[BOOTKEY] 非冷启动（reset_reason=%d），不连发\n", (int)reason);
   }
@@ -1447,6 +1723,7 @@ void loop() {
     processCommand(line);
   }
 
-  ledRefresh();  // 颜色没变时是空操作
+  ledFlashTick();  // 推进「指令闪灯」，没在闪的时候是空操作
+  ledRefresh();    // 颜色没变时是空操作
   delay(2);
 }

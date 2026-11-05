@@ -1,0 +1,36 @@
+name: esp32_keyboard_mobile
+description: "ESP32-S3 无线键盘 —— 手机遥控端（Android / iOS）"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.13.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # 固定 1.36.8：这一版是 BSD-3。2.x 起改成「商业使用需购买许可」并带构建期
+  # 许可上报，本项目是 MIT 开源工具，不想把这种约束带给使用者。
+  flutter_blue_plus: 1.36.8
+  shared_preferences: ^2.5.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
+
+# 图标：和 macOS / Windows 客户端用同一张 app_icon.png（tools/make_mobile_icons.sh 生成）
+flutter_launcher_icons:
+  image_path: "assets/app_icon.png"
+  android: true
+  ios: true
+  remove_alpha_ios: true
+  min_sdk_android: 23

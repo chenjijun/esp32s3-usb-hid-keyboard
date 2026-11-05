@@ -101,10 +101,50 @@ exec "\$PY" "\$SCRIPT" "\$@"
 LAUNCH
 chmod +x "$APP/Contents/MacOS/launch"
 
-if ! codesign --force --deep --sign - "$APP" >/dev/null 2>&1; then
-    echo "提示：ad-hoc 签名失败，本机运行一般仍然可用" >&2
+echo "== 签名 =="
+# 和 mac_swift/build.sh 共用同一套身份，原因也一样：
+# macOS 的 TCC（蓝牙、辅助功能）是按「代码签名身份」记账的。ad-hoc 签名
+# （codesign -s -）里唯一能标识它的是 cdhash，而 cdhash 每次重打包都会变，
+# 系统就当成另一个 App，于是蓝牙授权、辅助功能授权全部作废——这就是
+# 「每次打包后都要重新授权」的根源。
+#
+# 换成固定证书后，指定要求变成
+#   identifier "local.esp32keyboard" and certificate leaf = H"..."
+# 只认证书、不认 cdhash，重新打包多少次都是同一个 App，授权不再掉。
+# 证书由 ./mac_swift/make_cert.sh 生成（一次性，放在专用钥匙串里）。
+CERT_DEFAULT="${CERT_DEFAULT:-ESP32KeyboardLocal}"
+SIGN_KEYCHAIN="${SIGN_KEYCHAIN:-$HOME/Library/Keychains/esp32-signing.keychain-db}"
+KC_PASS="${KC_PASS:-esp32local}"
+
+SIGNED_WITH=""
+if [ -n "${SIGN_IDENTITY:-}" ]; then
+    SIGNED_WITH="$SIGN_IDENTITY"
+    codesign --force --timestamp=none --sign "$SIGNED_WITH" "$APP"
+elif security find-identity -v -p codesigning "$SIGN_KEYCHAIN" 2>/dev/null \
+        | grep -Fq "\"$CERT_DEFAULT\""; then
+    SIGNED_WITH="$CERT_DEFAULT"
+    echo "   使用证书：$SIGNED_WITH"
+    echo "   钥匙串：${SIGN_KEYCHAIN}（已解锁，签名不会弹授权框）"
+    # 钥匙串闲置久了会自己锁上；解锁后 codesign 才能静默读私钥
+    security unlock-keychain -p "$KC_PASS" "$SIGN_KEYCHAIN"
+    codesign --force --timestamp=none --keychain "$SIGN_KEYCHAIN" \
+        --sign "$SIGNED_WITH" "$APP"
+else
+    echo "   ⚠ ad-hoc（没找到固定证书）：每次重打包都要重新授权"
+    echo "     一次性解决：先跑 ./mac_swift/make_cert.sh，再重新执行本脚本"
+    codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || {
+        echo "提示：ad-hoc 签名失败，本机运行一般仍然可用" >&2
+    }
+fi
+
+if [ -n "$SIGNED_WITH" ]; then
+    echo "   指定要求：$(codesign -d -r- "$APP" 2>&1 | sed -n 's/^designated => //p')"
 fi
 
 echo "已生成: ${APP}（版本 ${VERSION}）"
 echo "双击它启动；第一次点「连接」时系统会弹蓝牙授权，点「允许」。"
 echo "要用「本机键盘转发」，还需在 系统设置 → 隐私与安全性 → 辅助功能 里勾选本 App。"
+if [ -z "$SIGNED_WITH" ]; then
+    echo
+    echo "⚠ 本次是 ad-hoc 签名：下次重打包系统会当成新 App，授权要重新点一遍。"
+fi

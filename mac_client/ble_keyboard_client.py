@@ -9,10 +9,13 @@
   · 连接阶段可见：扫描 / 连接 / 超时倒计时，随时可以「停止」
   · 屏幕键盘：粘滞修饰键，点击走 DOWN → 30ms → UP（和本机转发同一条路径）
   · 鼠标：拖拽区移动指针 + 左中右三键 + 滚轮 + 「按住左键」+ 速度倍率
-  · BIOS 引导键：写进固件（NVS 掉电保持）、立即连发、查询当前值
+  · BIOS 引导键：Del / Esc / F1~F12 / 关闭，连发时长与间隔可调，
+    一起写进固件（NVS 掉电保持）；立即连发、查询当前值
+  · 折叠：BIOS / 文字 / 快捷键三块点标题栏收起，状态记在 ui.json
+  · 配色：跟随系统明暗，青紫强调；顶栏「外观」按钮可以当场切换
   · 本机键盘转发：整块键盘接管，修饰键镜像（Windows 上能切输入法），
-    Ctrl+Alt+Esc 紧急停止
-  · 日志面板：显示固件回执（PONG / BOOTKEY:…）与错误
+    Ctrl+Shift+E（或 Ctrl+Alt+Esc）紧急停止
+  · 日志面板：显示固件回执（PONG / BOOTKEY / BOOTCFG）与错误
 
 两个平台的差异只在本机键盘转发这一层：
     macOS   CGEventTap（需要 pyobjc + 辅助功能授权）
@@ -23,6 +26,7 @@
     python3 ble_keyboard_client.py --cli               # 命令行，逐行输入协议命令
     python3 ble_keyboard_client.py --cli --mode wifi   # 走 Wi-Fi
     python3 ble_keyboard_client.py --name XXX          # 指定 BLE 设备名
+    python3 ble_keyboard_client.py --theme dark        # 强制深色（默认 auto 跟随系统）
 
 依赖：
     pip3 install -r requirements.txt
@@ -33,6 +37,7 @@
 import argparse
 import asyncio
 import ctypes
+import json
 import math
 import os
 import queue
@@ -55,8 +60,10 @@ except ImportError:      # 允许在无 tkinter 的环境下使用 --cli
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
 
-# 紧急停止组合键：两个平台上分别是 ⌃⌥Esc 和 Ctrl+Alt+Esc
+# 紧急停止组合键：两个平台上分别是 ⌃⌥Esc / Ctrl+Alt+Esc，
+# 备用一套 ⌃⇧E / Ctrl+Shift+E（Esc 那套在某些输入法 / 远程桌面里会被抢）
 STOP_COMBO = "Ctrl+Alt+Esc" if IS_WIN else "⌃⌥Esc"
+STOP_COMBO_2 = "Ctrl+Shift+E" if IS_WIN else "⌃⇧E"
 
 # 界面字体：macOS 用 Helvetica/Menlo（和预览图一致），Windows 用系统自带的
 # 中文字体，否则中文标签会落到没有中文字形的西文字体上。
@@ -142,7 +149,21 @@ class Cmd:
         return f"BOOTKEY:{token}"
 
     BOOT_KEY_QUERY = "BOOTKEY:?"
-    BOOT_KEY_NOW = "BOOTKEY:now"
+
+    @staticmethod
+    def boot_key_now(window_ms, gap_ms):
+        """立刻重来一轮连发，并顺手把时长/间隔写进固件（一次往返，少一次竞态）"""
+        return f"BOOTKEY:now {int(window_ms)} {int(gap_ms)}"
+
+    @staticmethod
+    def boot_key_window(ms):
+        """连发时长：开机后连发多久（固件会夹到 1000~60000ms）"""
+        return f"BOOTKEY:window {int(ms)}"
+
+    @staticmethod
+    def boot_key_gap(ms):
+        """连发间隔：每两下之间隔多久（固件会夹到 60~5000ms）"""
+        return f"BOOTKEY:gap {int(ms)}"
 
     # 鼠标：同一个 HID 接口下的第二个 report（ID 2），dx/dy 是 int8，单条 ±127
     @staticmethod
@@ -382,11 +403,56 @@ PRESETS_WIN = [
     ("截图", ["win", "shift", "s"]), ("表情符号", ["win", "."]),
 ]
 
-# BIOS / UEFI 启动键：客户端可以写进固件，让板子上电后自己连发
+# BIOS / UEFI 启动键：客户端可以写进固件，让板子上电后自己连发。
+#
+# 各家主板的「按 X 进设置」并不统一：技嘉/微星多是 Del，华硕/联想多是 F2，
+# 品牌整机还可能是 F10 / F12 / Esc，个别工控板是 F1 / F8。
+# 所以 F1~F12 全给出来（和 Swift 版 Layout.biosKeys 同一份清单、同一个顺序），
+# 别让人因为一个键不对就以为功能坏了。
 BIOS_KEYS = [
-    ("Del", "delete"), ("F2", "f2"), ("F10", "f10"), ("F12", "f12"),
-    ("F1", "f1"), ("F8", "f8"), ("Esc", "esc"), ("关闭", "off"),
+    ("Del", "delete"), ("Esc", "esc"),
+    ("F1", "f1"), ("F2", "f2"), ("F3", "f3"), ("F4", "f4"),
+    ("F5", "f5"), ("F6", "f6"), ("F7", "f7"), ("F8", "f8"),
+    ("F9", "f9"), ("F10", "f10"), ("F11", "f11"), ("F12", "f12"),
+    ("关闭", "off"),
 ]
+
+# 连发节奏：范围与 Swift 版 UIState 里那两个 Stepper 一致，固件自己还会再夹一次
+BOOT_WINDOW_RANGE = (1, 60)          # 秒
+BOOT_GAP_RANGE = (60, 5000)          # 毫秒
+BOOT_HOLD_MS = 80                    # 固件固定值，只用于显示
+
+
+def parse_bootcfg(line):
+    """解析固件回执 `BOOTCFG:key=delete,win=10000,gap=220,hold=80`。
+
+    连发参数由固件保管（写在 NVS 里），客户端不自己记真值，
+    查询/写入后都以固件回报的这行为准。
+    不是这一行（或者数字坏了）返回 None。
+    """
+    if not line.startswith("BOOTCFG:"):
+        return None
+    fields = {}
+    for part in line.split(":", 1)[1].split(","):
+        name, sep, value = part.partition("=")
+        if sep:
+            fields[name.strip()] = value.strip()
+    try:
+        return {
+            "key": fields.get("key", ""),
+            "win_ms": int(fields.get("win", 0)),
+            "gap_ms": int(fields.get("gap", 0)),
+            "hold_ms": int(fields.get("hold", BOOT_HOLD_MS)),
+        }
+    except ValueError:
+        return None
+
+
+def boot_summary(cfg):
+    """一句话概括固件当前的引导键设置，卡片底部那行灰字用。"""
+    name = "已关闭" if cfg["key"] == "off" else cfg["key"].upper()
+    return (f"固件当前：{name} · 时长 {cfg['win_ms'] / 1000:g} 秒 · "
+            f"间隔 {cfg['gap_ms']}ms · 单次按下 {cfg['hold_ms']}ms")
 
 
 # ---------------------------------------------------------------------------
@@ -894,7 +960,7 @@ class KeyForwarder:
     要点（与 Swift 版 KeyForwarder 一致）：
       · 修饰键按 flags 全量镜像，纯修饰键操作（Shift、Ctrl+Space）也能发出去
       · 过滤自动重复（主机自己有重复，重复发会翻倍）
-      · ⌃⌥Esc 永远优先：立刻停止捕获并发 RELEASEALL
+      · ⌃⇧E / ⌃⌥Esc 永远优先：立刻停止捕获并发 RELEASEALL
       · 未映射的键放行给本机（不吞），避免「按了没反应也顾不上本机」
     """
 
@@ -1004,7 +1070,7 @@ class KeyForwarder:
         self._runloop = runloop
         Q.CFRunLoopAddSource(runloop, source, Q.kCFRunLoopCommonModes)
         Q.CGEventTapEnable(tap, True)
-        self.on_log("捕获已开启：本机按键会转发给主机（⌃⌥Esc 停止）")
+        self.on_log(f"捕获已开启：本机按键会转发给主机（{STOP_COMBO_2} 停止）")
 
         Q.CFRunLoopRun()                               # 阻塞到 stop()
 
@@ -1036,7 +1102,7 @@ class KeyForwarder:
         cmd = bool(flags & FLAG_COMMAND)
 
         if event_type == Q.kCGEventFlagsChanged:
-            if self._is_emergency(keycode, control, alt):
+            if self._is_emergency(keycode, control, alt, shift):
                 self._request_stop()
                 return None
             self._sync_modifiers(shift, control, alt, cmd, keycode)
@@ -1046,7 +1112,7 @@ class KeyForwarder:
             repeat = int(Q.CGEventGetIntegerValueField(event, Q.kCGKeyboardEventAutorepeat))
             if repeat:
                 return None
-            if self._is_emergency(keycode, control, alt):
+            if self._is_emergency(keycode, control, alt, shift):
                 self._request_stop()
                 return None
             self._sync_modifiers(shift, control, alt, cmd, None)
@@ -1078,13 +1144,20 @@ class KeyForwarder:
             self.on_command(Cmd.down(token))
 
     @staticmethod
-    def _is_emergency(keycode, control, alt):
-        return keycode == 53 and control and alt        # ⌃⌥Esc
+    def _is_emergency(keycode, control, alt, shift=False):
+        """两个紧急出口：⌃⌥Esc（macOS 习惯）和 ⌃⇧E（左手一伸就到）。
+
+        两套都判是有原因的：⌃⌥Esc 在某些远程桌面 / 输入法里会被抢走，
+        ⌃⇧E 留作备用；而且 E 键在键盘左上，按起来比 Esc 更顺手。
+        """
+        if control and alt and keycode == 53:          # ⌃⌥Esc
+            return True
+        return control and shift and keycode == 14     # ⌃⇧E（keyCode 14 = E）
 
     def _request_stop(self):
         def later():
             self.stop()
-            self.on_log("⌃⌥Esc：已停止捕获并松开所有按键")
+            self.on_log(f"{STOP_COMBO_2} / {STOP_COMBO}：已停止捕获并松开所有按键")
             if self.on_stop:
                 self.on_stop()
         threading.Timer(0.05, later).start()
@@ -1115,7 +1188,7 @@ class WinKeyForwarder:
     """接管本机键盘，把每一次按键原样转给被控主机。
 
     和 macOS 版是同一套规则：修饰键按「当前按下的集合」全量镜像、过滤自动
-    重复、Ctrl+Alt+Esc 永远优先、没映射的键放行给本机。区别只在钩子本身：
+    重复、Ctrl+Shift+E / Ctrl+Alt+Esc 永远优先、没映射的键放行给本机。区别只在钩子本身：
     Windows 用 ctypes 直接调 Win32 的低层键盘钩子，不需要装任何依赖，
     也不需要授权（只有「以管理员运行的窗口」的按键抓不到，这是系统限制）。
     """
@@ -1228,7 +1301,7 @@ class WinKeyForwarder:
             self.on_log(f"安装键盘钩子失败（错误码 {ctypes.get_last_error()}）", True)
             return
 
-        self.on_log(f"捕获已开启：本机按键会转发给主机（{STOP_COMBO} 停止）")
+        self.on_log(f"捕获已开启：本机按键会转发给主机（{STOP_COMBO_2} 停止）")
 
         msg = wintypes.MSG()
         try:
@@ -1269,9 +1342,14 @@ class WinKeyForwarder:
             self._sync_modifiers(side)
             return True                        # 修饰键不留给本机
 
-        if down and vk == 0x1B and "ctrl" in self._mods and "alt" in self._mods:
-            self._request_stop()
-            return True
+        if down and "ctrl" in self._mods:
+            # Ctrl+Alt+Esc 或 Ctrl+Shift+E：两套都留，任一下都能停
+            if vk == 0x1B and "alt" in self._mods:
+                self._request_stop()
+                return True
+            if vk == 0x45 and "shift" in self._mods:      # 0x45 = VK_E
+                self._request_stop()
+                return True
 
         token = VK_TO_TOKEN.get(vk)
         if token is None:
@@ -1327,26 +1405,329 @@ def make_forwarder(on_command, on_log):
 
 
 # ---------------------------------------------------------------------------
-# 四、图形界面
+# 四、配色与卡片
 # ---------------------------------------------------------------------------
-CARD_BG = "#ffffff"
-PAGE_BG = "#f2f2f4"
-INK = "#1d1d1f"
-INK_SOFT = "#6e6e73"
-ACCENT = "#0a84ff"
-DANGER = "#ff3b30"
-OK = "#34c759"
+# 取向和 mac_swift/Sources/Theme.swift 一致：**跟随系统明暗 + 青紫强调**。
+#
+# 为什么不用系统色：ttk 的控件的颜色由 NSAppearance 管，Python 改不动；
+# 系统强调色（那个蓝）又会从分段控件、进度条里探出来，和青紫调子打架。
+# 所以这里自己维护两套调色板：
+#   · 启动时读系统外观（macOS `defaults read -g AppleInterfaceStyle`，
+#     Windows 读注册表的 AppsUseLightTheme）
+#   · 顶栏「外观」按钮可以在 自动 → 浅色 → 深色 之间循环，写进 ui.json 下次还生效
+#   · 换色走 retint()：遍历控件树按 role 重新上色，不用重启、不用销毁界面
+#
+# 十六进制值就是 Theme.swift 里那几个 dyn(浅, 深) 的两端，改配色时两边一起改。
+
+THEME_LIGHT = {
+    "appearance": "light",
+    "canvas": "#ECEFF7",        # 窗口底，比纯白偏冷一档，卡片压上去才有层次
+    "card": "#FFFFFF",
+    "card_stroke": "#DDE2EE",   # 卡片描边
+    "well": "#E6EAF3",          # 凹槽：日志、拖拽区、进度条槽
+    "key": "#F2F4FA",           # 键格 / 次级控件
+    "key_active": "#E4E8F1",
+    "ink": "#1B2130",
+    "ink_soft": "#5C6577",
+    "ink_faint": "#6B7385",
+    "brand": "#0C7A91",         # 青：标题图标、选中键、进度条
+    "brand_alt": "#6C5CE7",     # 紫：渐变另一端、折叠箭头
+    "brand_soft": "#DCF0F5",    # 品牌色淡底：选中键、粘滞键、按键闪一下
+    "on_brand": "#FFFFFF",      # 压在品牌色块上的字
+    "on_danger": "#FFFFFF",
+    "primary": "#0B7A93",       # 主按钮，比 brand 深一档，保证白字可读
+    "primary_active": "#096578",
+    "danger": "#D23A40",
+    "danger_active": "#B83238",
+    "warn": "#9A6206",
+    "warn_soft": "#FBEBCF",
+    "ok": "#0F9D74",            # 已连接 / 已授权
+    "busy": "#7C5CF0",          # 扫描、连接中
+    "idle": "#A8AEBE",          # 未连接
+    "log_err": "#C0392B",
+    "log_ok": "#1F7A4D",
+    "log_recv": "#0E6FA6",
+    "tab_bg": "#EAEEF7",
+    "tab_sel": "#FFFFFF",
+}
+
+THEME_DARK = {
+    "appearance": "dark",
+    "canvas": "#0D0F14",
+    "card": "#1C2029",
+    "card_stroke": "#2A3140",
+    "well": "#080A0E",          # 比 canvas 再深一档，否则日志区会和窗口底连成一片
+    "key": "#232834",
+    "key_active": "#2C3341",
+    "ink": "#E9EDF6",
+    "ink_soft": "#9AA3B5",
+    "ink_faint": "#8B94A7",
+    "brand": "#3BE0FF",
+    "brand_alt": "#B18CFF",
+    "brand_soft": "#143844",
+    "on_brand": "#0A0E14",      # 深色下品牌色是亮青，白字会糊，反过来用近黑
+    "on_danger": "#FFFFFF",
+    "primary": "#1A8FA8",
+    "primary_active": "#157A8F",
+    "danger": "#C03A40",
+    "danger_active": "#A33136",
+    "warn": "#C98A1E",
+    "warn_soft": "#3A2E17",
+    "ok": "#3BE0A8",
+    "busy": "#A98BFF",
+    "idle": "#5A6274",
+    "log_err": "#FF8B8B",
+    "log_ok": "#6FE3B4",
+    "log_recv": "#7FD3FF",
+    "tab_bg": "#232834",
+    "tab_sel": "#2C3341",
+}
+
+T = dict(THEME_LIGHT)          # 当前生效的一套
+THEME_MODE = "auto"            # auto / light / dark（--theme 或 ui.json 决定）
 
 
-def _mk_card(parent, title):
-    frame = tk.LabelFrame(parent, text=" " + title + " ", padx=10, pady=8,
-                          fg=INK_SOFT, bg=CARD_BG, bd=1, relief="solid",
-                          font=(UI_FAMILY, 11, "bold"))
-    return frame
+def detect_appearance():
+    """读系统当前的明暗。读不到就当浅色——和系统默认一致，不会突然全黑。"""
+    if IS_MAC:
+        try:
+            done = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
+                                  capture_output=True, text=True, timeout=2)
+            return "dark" if done.returncode == 0 and "Dark" in done.stdout else "light"
+        except (OSError, subprocess.SubprocessError):
+            return "light"
+    if IS_WIN:
+        try:
+            import winreg
+            with winreg.OpenKey(
+                    winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+                value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            return "light" if value else "dark"
+        except Exception:                                   # noqa: BLE001
+            return "light"
+    return "light"
+
+
+def _ui_state_path():
+    if IS_WIN:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif IS_MAC:
+        base = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return Path(base) / "ESP32Keyboard" / "ui.json"
+
+
+UI_STATE_PATH = _ui_state_path()
+
+
+def load_ui_state():
+    """读界面上次的样子（折叠了哪几张卡、外观选的哪个）。读坏了就当空的。"""
+    try:
+        with open(UI_STATE_PATH, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_ui_state(**patch):
+    """合并写回。这些只是界面偏好，写不进去（没权限、只读盘）也不该影响使用。"""
+    data = load_ui_state()
+    data.update(patch)
+    try:
+        UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(UI_STATE_PATH, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def use_theme(mode):
+    """按 mode（auto/light/dark）挑一套调色板装进全局 T，返回实际生效的明暗。"""
+    global T, THEME_MODE
+    THEME_MODE = mode if mode in ("auto", "light", "dark") else "auto"
+    dark = (detect_appearance() == "dark") if THEME_MODE == "auto" else THEME_MODE == "dark"
+    T = dict(THEME_DARK if dark else THEME_LIGHT)
+    return T["appearance"]
+
+
+def _walk(widget):
+    yield widget
+    for child in widget.winfo_children():
+        yield from _walk(child)
+
+
+def _paint(widget, role):
+    """按 role 给一个控件上色；控件不认某个选项就跳过（tk 会抛 TclError）。"""
+    try:
+        if role == "page":
+            widget.configure(bg=T["canvas"])
+        elif role == "page_label":
+            widget.configure(bg=T["canvas"], fg=T["ink"])
+        elif role == "page_soft":
+            widget.configure(bg=T["canvas"], fg=T["ink_soft"])
+        elif role == "card":
+            widget.configure(bg=T["card"])
+        elif role == "card_edge":
+            widget.configure(bg=T["card"], highlightbackground=T["card_stroke"])
+        elif role == "label":
+            widget.configure(bg=T["card"], fg=T["ink"])
+        elif role == "soft":
+            widget.configure(bg=T["card"], fg=T["ink_soft"])
+        elif role == "faint":
+            widget.configure(bg=T["card"], fg=T["ink_faint"])
+        elif role == "brand":
+            widget.configure(bg=T["card"], fg=T["brand"])
+        elif role == "brand_alt":
+            widget.configure(bg=T["card"], fg=T["brand_alt"])
+        elif role == "entry":
+            widget.configure(bg=T["card"], fg=T["ink"], insertbackground=T["ink"],
+                             highlightbackground=T["card_stroke"],
+                             highlightcolor=T["brand"])
+        elif role == "spin":
+            widget.configure(bg=T["card"], fg=T["ink"], insertbackground=T["ink"],
+                             buttonbackground=T["key"], buttonuprelief="flat",
+                             buttondownrelief="flat", relief="flat", bd=0,
+                             highlightbackground=T["card_stroke"],
+                             highlightcolor=T["brand"])
+        elif role == "btn":
+            widget.configure(bg=T["key"], fg=T["ink"],
+                             activebackground=T["key_active"], activeforeground=T["ink"])
+        elif role == "primary":
+            widget.configure(bg=T["primary"], fg=T["on_brand"],
+                             activebackground=T["primary_active"],
+                             activeforeground=T["on_brand"])
+        elif role == "danger":
+            widget.configure(bg=T["danger"], fg=T["on_danger"],
+                             activebackground=T["danger_active"],
+                             activeforeground=T["on_danger"])
+        elif role == "warn":
+            widget.configure(bg=T["warn"], fg=T["on_brand"],
+                             activebackground=T["warn"], activeforeground=T["on_brand"])
+        elif role == "warn_soft":
+            widget.configure(bg=T["warn_soft"], fg=T["warn"],
+                             activebackground=T["warn_soft"], activeforeground=T["warn"])
+        elif role == "select":      # indicatoron=0 的 Radiobutton
+            widget.configure(bg=T["key"], fg=T["ink"], selectcolor=T["brand_soft"],
+                             activebackground=T["key_active"], activeforeground=T["ink"])
+        elif role == "scale":
+            widget.configure(bg=T["card"], troughcolor=T["key"], fg=T["ink_soft"],
+                             highlightthickness=0)
+        elif role == "well":
+            widget.configure(bg=T["well"], highlightbackground=T["card_stroke"])
+        elif role == "log":
+            widget.configure(bg=T["well"], fg=T["ink"], insertbackground=T["ink"],
+                             selectbackground=T["brand_soft"], selectforeground=T["ink"])
+        elif role == "dot":
+            widget.configure(bg=T["card"])
+        elif role == "dot_page":
+            widget.configure(bg=T["canvas"])
+    except tk.TclError:
+        pass
+
+
+def _style(widget, role):
+    """打上 role 并按当前调色板上色，返回控件本身（方便链式写）。"""
+    widget._role = role
+    _paint(widget, role)
+    return widget
+
+
+class Card:
+    """一张卡片：描边浅底 + 标题栏 + 内容区。
+
+    给 key 就能折叠（key 也是 ui.json 里记的标识）。收起时内容区用 pack_forget
+    从布局里摘掉（不是销毁），所以展开回来控件状态还在——输入一半的文字、
+    已经滚到哪一行的日志都不会丢。
+    """
+
+    def __init__(self, parent, title, key=None, summary="", on_toggle=None):
+        self.key = key
+        self._summary = summary
+        self._collapsed = False
+        self._on_toggle = on_toggle
+
+        self.frame = tk.Frame(parent, bg=T["card"], padx=11, pady=0,
+                              highlightbackground=T["card_stroke"],
+                              highlightthickness=1, bd=0)
+        _style(self.frame, "card_edge")
+
+        self.head = _style(tk.Frame(self.frame, bg=T["card"]), "card")
+        self.head.pack(fill="x", pady=(8, 0))
+
+        self.arrow = _style(tk.Label(self.head, text="▾", bg=T["card"], fg=T["brand_alt"],
+                                     font=(UI_FAMILY, 10)), "brand_alt")
+        self.arrow.pack(side="left")
+
+        self.title_lbl = _style(
+            tk.Label(self.head, text=title, bg=T["card"], fg=T["ink_soft"],
+                     font=(UI_FAMILY, 11, "bold")), "soft")
+        self.title_lbl.pack(side="left", padx=(4, 0))
+
+        self.summary_lbl = _style(
+            tk.Label(self.head, text=summary, bg=T["card"], fg=T["ink_faint"],
+                     font=(UI_FAMILY, 10)), "faint")
+
+        self.body = _style(tk.Frame(self.frame, bg=T["card"]), "card")
+        self.body.pack(fill="both", expand=True, pady=(6, 9))
+
+        if self.key is not None:
+            for widget in (self.head, self.arrow, self.title_lbl, self.summary_lbl):
+                widget.configure(cursor="hand2")
+                widget.bind("<Button-1>", self._clicked)
+            self.head.bind("<Enter>", lambda _e: self.title_lbl.configure(fg=T["brand"]))
+            self.head.bind("<Leave>", lambda _e: self.title_lbl.configure(fg=T["ink_soft"]))
+            self.apply_state()
+
+    # -- 折叠 -------------------------------------------------------------
+    def _clicked(self, _event=None):
+        self.toggle()
+
+    def toggle(self):
+        self._collapsed = not self._collapsed
+        self.apply_state()
+        if self._on_toggle is not None:
+            self._on_toggle(self.key, self._collapsed)
+
+    @property
+    def collapsed(self):
+        return self._collapsed
+
+    def set_collapsed(self, collapsed):
+        self._collapsed = bool(collapsed)
+        self.apply_state()
+
+    def apply_state(self):
+        """把折叠状态落到布局上：收起来就摘掉内容区，并把概要挪到标题右边。"""
+        if self.key is None:
+            return
+        if self._collapsed:
+            self.body.pack_forget()
+            self.arrow.configure(text="▸")
+            if self._summary:
+                self.summary_lbl.pack(side="left", padx=(8, 0))
+        else:
+            self.body.pack(fill="both", expand=True, pady=(6, 9))
+            self.summary_lbl.pack_forget()
+            self.arrow.configure(text="▾")
+
+    def set_summary(self, text):
+        """概要只在收起时露出来（和 Swift 版 Card 的 summary 一致）。"""
+        self._summary = text
+        self.summary_lbl.configure(text=text)
+        if self._collapsed:
+            if text:
+                self.summary_lbl.pack(side="left", padx=(8, 0))
+            else:
+                self.summary_lbl.pack_forget()
+
 
 
 class App:
-    def __init__(self, root, device_name=DEFAULT_NAME, host=DEFAULT_HOST, port=DEFAULT_PORT):
+    def __init__(self, root, device_name=DEFAULT_NAME, host=DEFAULT_HOST, port=DEFAULT_PORT,
+                 theme=None):
         self.root = root
         self.events = queue.Queue()
         self.link = Link(self.events.put)
@@ -1358,7 +1739,23 @@ class App:
         self.mod_buttons = {}
         self.mouse_held = set()
         self.drag_lock = False
-        self.bios_current = "delete"
+
+        # 连发节奏（最终写给固件，客户端只记「这次要发什么」；连上后查询会以固件为准）
+        self.boot_window = 10.0        # 秒
+        self.boot_gap = 220.0          # 毫秒
+
+        # 界面偏好：折叠了哪几张卡、外观选的哪个。
+        # 对应 Swift 版存在 UserDefaults 里的 collapsedSections；这里存 ui.json，
+        # 换外观同理（自动 / 浅色 / 深色），下次打开还是上次的样子。
+        self.ui_state = load_ui_state()
+        # 上次写进固件的引导键：不记这一笔的话，重开 App 又回到出厂 delete，
+        # 随手点一次「写入固件」（哪怕只想改连发时长）就把「关闭」改回开机敲键
+        self.bios_current = self.ui_state.get("bios_key") or "delete"
+        self.collapsed = set(self.ui_state.get("collapsed") or [])
+        self.cards = {}
+        # 命令行显式给了 --theme 就优先，否则用上次在界面里选的
+        use_theme(theme or self.ui_state.get("theme") or "auto")
+        self.appearance = T["appearance"]
 
         # 鼠标位移攒批
         self._pad_pending = [0.0, 0.0]
@@ -1369,12 +1766,17 @@ class App:
         # 屏幕键盘点击串行化
         self._tap_busy_until = 0.0
 
+        # 链路状态迁移检测 + 「连上后问引导键」有没有收到回执
+        self._last_link_state = "idle"
+        self._boot_reply_seen = False
+
         root.title("ESP32-S3 无线键盘（Python 版）")
         root.minsize(1200, 760)
-        root.configure(bg=PAGE_BG)
+        root.configure(bg=T["canvas"])
         root.columnconfigure(0, weight=1)
         root.rowconfigure(2, weight=1)
 
+        self._apply_ttk_style()
         self._build_top(device_name, host, port)
         self._build_cards()
         self._build_bottom()
@@ -1384,87 +1786,161 @@ class App:
         root.after(100, self._poll)
         self._refresh_trust()
 
+    # -- 换肤 --------------------------------------------------------------
+    def _apply_ttk_style(self):
+        """ttk 控件（Notebook / 进度条 / 滚动条）走 ttk.Style 上色。
+
+        用 clam 而不是平台默认主题：aqua / vista 会把背景、选中块画成系统色，
+        configure 几乎全被忽略，深色下那几个控件就会亮得刺眼。
+        """
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        style.configure("TNotebook", background=T["card"], borderwidth=0,
+                        tabmargins=(0, 2, 0, 0))
+        style.configure("TNotebook.Tab", background=T["tab_bg"], foreground=T["ink_soft"],
+                        padding=(12, 4), borderwidth=0, font=(UI_FAMILY, 10))
+        style.map("TNotebook.Tab",
+                  background=[("selected", T["tab_sel"])],
+                  foreground=[("selected", T["brand"])])
+        style.configure("TProgressbar", troughcolor=T["well"], background=T["brand"],
+                        bordercolor=T["well"], lightcolor=T["brand"], darkcolor=T["brand"],
+                        borderwidth=0, thickness=8)
+        style.configure("TScrollbar", background=T["key"], troughcolor=T["well"],
+                        bordercolor=T["well"], arrowcolor=T["ink_soft"], borderwidth=0,
+                        relief="flat")
+        style.map("TScrollbar", background=[("active", T["key_active"])])
+
+    def retint(self):
+        """按当前调色板重刷整棵控件树。不重建界面，所以输入框、日志都还在。"""
+        for widget in _walk(self.root):
+            role = getattr(widget, "_role", None)
+            if role:
+                _paint(widget, role)
+        self.root.configure(bg=T["canvas"])
+        self.pad.configure(bg=T["well"], highlightbackground=T["card_stroke"])
+        self.pad.itemconfigure(self._pad_hint, fill=T["ink_faint"])
+        for tag, key in (("err", "log_err"), ("ok", "log_ok"), ("recv", "log_recv")):
+            self.log_text.tag_configure(tag, foreground=T[key])
+        self._apply_ttk_style()
+        self._paint_status()
+        self._paint_mod_all()
+        self._paint_lock()
+        self._update_appearance_btn()
+
+    def _cycle_appearance(self):
+        """自动 → 浅色 → 深色 → 自动。选了就存下来，下次打开照这个来。"""
+        order = ("auto", "light", "dark")
+        index = order.index(THEME_MODE) if THEME_MODE in order else 0
+        self.appearance = use_theme(order[(index + 1) % len(order)])
+        self.retint()
+        save_ui_state(theme=THEME_MODE)
+
+    def _update_appearance_btn(self):
+        text = {"auto": "外观：跟随系统", "light": "外观：浅色",
+                "dark": "外观：深色"}.get(THEME_MODE, "外观：跟随系统")
+        self.appearance_btn.configure(text=text)
+
     # -- 顶部：模式 / 地址 / 连接 -----------------------------------------
     def _build_top(self, device_name, host, port):
-        outer = tk.Frame(self.root, bg=PAGE_BG, padx=12, pady=8)
+        outer = _style(tk.Frame(self.root, bg=T["canvas"], padx=12, pady=8), "page")
         outer.grid(row=0, column=0, sticky="ew")
         outer.columnconfigure(0, weight=1)
 
-        row = tk.Frame(outer, bg=PAGE_BG)
+        row = _style(tk.Frame(outer, bg=T["canvas"]), "page")
         row.grid(row=0, column=0, sticky="ew")
 
-        tk.Label(row, text="链路", bg=PAGE_BG, fg=INK).pack(side="left")
+        _style(tk.Label(row, text="链路", bg=T["canvas"], fg=T["ink"]), "page_label").pack(
+            side="left")
 
         self.mode_var = tk.StringVar(value="ble")
         self.mode_buttons = {}
         for value, text in (("ble", "蓝牙"), ("wifi", "Wi-Fi")):
-            btn = tk.Radiobutton(row, text=text, value=value, variable=self.mode_var,
-                                 indicatoron=0, width=7, command=self._on_mode_change,
-                                 fg=INK, bg="#e6e6e9", selectcolor="#cfe6ff",
-                                 activebackground="#dcdce0", relief="flat", bd=0,
-                                 padx=6, pady=3)
+            btn = _style(tk.Radiobutton(row, text=text, value=value,
+                                        variable=self.mode_var, indicatoron=0, width=7,
+                                        command=self._on_mode_change, relief="flat", bd=0,
+                                        padx=6, pady=3), "select")
             btn.pack(side="left", padx=(4, 0))
             self.mode_buttons[value] = btn
 
-        tk.Label(row, text="设备名", bg=PAGE_BG, fg=INK).pack(side="left", padx=(14, 4))
+        _style(tk.Label(row, text="设备名", bg=T["canvas"], fg=T["ink"]),
+               "page_label").pack(side="left", padx=(14, 4))
         self.name_var = tk.StringVar(value=device_name)
-        self.name_entry = tk.Entry(row, textvariable=self.name_var, width=14)
-        self.name_entry.pack(side="left")
+        self.name_entry = _style(
+            tk.Entry(row, textvariable=self.name_var, width=14, relief="flat", bd=0,
+                     highlightthickness=1, highlightbackground=T["card_stroke"],
+                     highlightcolor=T["brand"]), "entry")
+        self.name_entry.pack(side="left", ipady=3, ipadx=4)
 
-        tk.Label(row, text="主机", bg=PAGE_BG, fg=INK).pack(side="left", padx=(12, 4))
+        _style(tk.Label(row, text="主机", bg=T["canvas"], fg=T["ink"]),
+               "page_label").pack(side="left", padx=(12, 4))
         self.host_var = tk.StringVar(value=host)
-        self.host_entry = tk.Entry(row, textvariable=self.host_var, width=12)
-        self.host_entry.pack(side="left")
+        self.host_entry = _style(
+            tk.Entry(row, textvariable=self.host_var, width=12, relief="flat", bd=0,
+                     highlightthickness=1, highlightbackground=T["card_stroke"],
+                     highlightcolor=T["brand"]), "entry")
+        self.host_entry.pack(side="left", ipady=3, ipadx=4)
 
-        tk.Label(row, text="端口", bg=PAGE_BG, fg=INK).pack(side="left", padx=(8, 4))
+        _style(tk.Label(row, text="端口", bg=T["canvas"], fg=T["ink"]),
+               "page_label").pack(side="left", padx=(8, 4))
         self.port_var = tk.StringVar(value=str(port))
-        self.port_entry = tk.Entry(row, textvariable=self.port_var, width=6)
-        self.port_entry.pack(side="left")
+        self.port_entry = _style(
+            tk.Entry(row, textvariable=self.port_var, width=6, relief="flat", bd=0,
+                     highlightthickness=1, highlightbackground=T["card_stroke"],
+                     highlightcolor=T["brand"]), "entry")
+        self.port_entry.pack(side="left", ipady=3, ipadx=4)
 
-        # 第二行：连接按钮 + 状态点 + 文案 + 倒计时进度条（右端是模式提示）
-        status_row = tk.Frame(outer, bg=PAGE_BG, pady=4)
+        # 第二行：连接按钮 + 状态点 + 文案 + 倒计时进度条（右端是外观与模式提示）
+        status_row = _style(tk.Frame(outer, bg=T["canvas"], pady=4), "page")
         status_row.grid(row=1, column=0, sticky="ew")
 
-        self.connect_btn = tk.Button(status_row, text="连接", width=7,
-                                     command=self.on_connect,
-                                     fg="#ffffff", bg=ACCENT, activebackground="#0b74dd",
-                                     activeforeground="#ffffff", relief="flat", bd=0,
-                                     padx=6, pady=4)
+        self.connect_btn = _style(
+            tk.Button(status_row, text="连接", width=7, command=self.on_connect,
+                      relief="flat", bd=0, padx=6, pady=4), "primary")
         self.connect_btn.pack(side="left")
 
-        self.stop_btn = tk.Button(status_row, text="停止", width=6, command=self.on_stop,
-                                  fg="#ffffff", bg=DANGER, activebackground="#d92b20",
-                                  activeforeground="#ffffff", relief="flat", bd=0,
-                                  padx=6, pady=4, state="disabled")
+        self.stop_btn = _style(
+            tk.Button(status_row, text="停止", width=6, command=self.on_stop,
+                      relief="flat", bd=0, padx=6, pady=4, state="disabled"), "danger")
         self.stop_btn.pack(side="left", padx=(6, 0))
 
-        self.disconnect_btn = tk.Button(status_row, text="断开", width=6,
-                                        command=self.on_disconnect, relief="flat", bd=0,
-                                        padx=6, pady=4, bg="#e6e6e9")
+        self.disconnect_btn = _style(
+            tk.Button(status_row, text="断开", width=6, command=self.on_disconnect,
+                      relief="flat", bd=0, padx=6, pady=4), "btn")
         self.disconnect_btn.pack(side="left", padx=(6, 0))
 
-        self.release_btn = tk.Button(status_row, text="释放全部按键",
-                                     command=self.on_release_all, relief="flat", bd=0,
-                                     padx=8, pady=4, bg="#e6e6e9")
+        self.release_btn = _style(
+            tk.Button(status_row, text="释放全部按键", command=self.on_release_all,
+                      relief="flat", bd=0, padx=8, pady=4), "btn")
         self.release_btn.pack(side="left", padx=(6, 14))
 
-        self.dot = tk.Canvas(status_row, width=12, height=12, bg=PAGE_BG,
-                             highlightthickness=0)
+        self.dot = _style(tk.Canvas(status_row, width=12, height=12, bg=T["canvas"],
+                                    highlightthickness=0), "dot_page")
         self.dot.pack(side="left")
-        self._dot_item = self.dot.create_oval(2, 2, 11, 11, fill="#b0b0b5", outline="")
+        self._dot_item = self.dot.create_oval(2, 2, 11, 11, fill=T["idle"], outline="")
 
         self.status_var = tk.StringVar(value="未连接")
-        tk.Label(status_row, textvariable=self.status_var, bg=PAGE_BG, fg=INK,
-                 anchor="w").pack(side="left", padx=(6, 10))
+        _style(tk.Label(status_row, textvariable=self.status_var, bg=T["canvas"],
+                        fg=T["ink"], anchor="w"), "page_label").pack(
+            side="left", padx=(6, 10))
 
         self.progress = ttk.Progressbar(status_row, mode="determinate", maximum=1.0,
                                         length=180)
         self.progress.pack(side="left")
         self.progress.pack_forget()
 
+        # 右端：外观切换（点了当场换色，不用重启）+ 模式提示
+        self.appearance_btn = _style(
+            tk.Button(status_row, text="外观：跟随系统", command=self._cycle_appearance,
+                      relief="flat", bd=0, padx=8, pady=3, font=(UI_FAMILY, 10)), "btn")
+        self.appearance_btn.pack(side="right", padx=(10, 0))
+        self._update_appearance_btn()
+
         self.hint_var = tk.StringVar(value="")
-        tk.Label(status_row, textvariable=self.hint_var, bg=PAGE_BG, fg=INK_SOFT,
-                 anchor="e").pack(side="right")
+        _style(tk.Label(status_row, textvariable=self.hint_var, bg=T["canvas"],
+                        fg=T["ink_soft"], anchor="e"), "page_soft").pack(side="right")
 
         self._on_mode_change()
 
@@ -1478,233 +1954,376 @@ class App:
             else "板子上的 BOOT 键切到蓝牙模式（灯蓝色）")
 
     # -- 中部：本机转发 / BIOS / 文字+快捷键 --------------------------------
+    def _new_card(self, parent, title, key=None, summary=""):
+        """建一张卡；给 key 就是可折叠的（折叠状态沿用上次存的）。"""
+        card = Card(parent, title, key=key, summary=summary, on_toggle=self._on_card_toggle)
+        if key is not None:
+            self.cards[key] = card
+            card.set_collapsed(key in self.collapsed)
+        return card
+
+    def _on_card_toggle(self, key, collapsed):
+        if collapsed:
+            self.collapsed.add(key)
+        else:
+            self.collapsed.discard(key)
+        save_ui_state(collapsed=sorted(self.collapsed))
+
     def _build_cards(self):
-        wrap = tk.Frame(self.root, bg=PAGE_BG, padx=12, pady=6)
+        wrap = _style(tk.Frame(self.root, bg=T["canvas"], padx=12, pady=6), "page")
         wrap.grid(row=1, column=0, sticky="ew")
         wrap.columnconfigure(0, weight=0)
         wrap.columnconfigure(1, weight=0)
         wrap.columnconfigure(2, weight=1)
 
-        self._build_capture_card(wrap).grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        self._build_bios_card(wrap).grid(row=0, column=1, sticky="nsew", padx=(0, 8))
+        self._build_capture_card(wrap).frame.grid(row=0, column=0, sticky="nsew",
+                                                  padx=(0, 8))
+        self._build_bios_card(wrap).frame.grid(row=0, column=1, sticky="nsew",
+                                               padx=(0, 8))
         self._build_right_cards(wrap).grid(row=0, column=2, sticky="nsew")
 
     def _build_capture_card(self, parent):
-        card = _mk_card(parent, "本机键盘转发")
-        card.columnconfigure(0, weight=1)
+        card = self._new_card(parent, "本机键盘转发")
+        body = card.body
+        body.columnconfigure(0, weight=1)
 
-        line = tk.Frame(card, bg=CARD_BG)
+        line = _style(tk.Frame(body, bg=T["card"]), "card")
         line.grid(row=0, column=0, sticky="ew")
-        self.trust_dot = tk.Canvas(line, width=12, height=12, bg=CARD_BG,
-                                   highlightthickness=0)
+        self.trust_dot = _style(tk.Canvas(line, width=12, height=12, bg=T["card"],
+                                          highlightthickness=0), "dot")
         self.trust_dot.pack(side="left")
-        self._trust_item = self.trust_dot.create_oval(2, 2, 11, 11, fill="#b0b0b5",
-                                                     outline="")
+        self._trust_item = self.trust_dot.create_oval(2, 2, 11, 11, fill=T["idle"],
+                                                      outline="")
         self.trust_var = tk.StringVar(value="检查权限…")
-        tk.Label(line, textvariable=self.trust_var, bg=CARD_BG, fg=INK).pack(
-            side="left", padx=(6, 0))
+        _style(tk.Label(line, textvariable=self.trust_var, bg=T["card"], fg=T["ink"]),
+               "label").pack(side="left", padx=(6, 0))
 
-        btns = tk.Frame(card, bg=CARD_BG)
+        btns = _style(tk.Frame(body, bg=T["card"]), "card")
         btns.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        self.capture_btn = tk.Button(btns, text="开始捕获", width=9,
-                                     command=self.on_capture, relief="flat", bd=0,
-                                     padx=8, pady=4, bg="#e6e6e9")
+        self.capture_btn = _style(
+            tk.Button(btns, text="开始捕获", width=9, command=self.on_capture,
+                      relief="flat", bd=0, padx=8, pady=4), "btn")
         self.capture_btn.pack(side="left")
-        self.capture_stop_btn = tk.Button(btns, text="停止", width=6,
-                                          command=self.on_stop_capture, relief="flat",
-                                          bd=0, padx=8, pady=4, bg="#e6e6e9",
-                                          state="disabled")
+        self.capture_stop_btn = _style(
+            tk.Button(btns, text="停止", width=6, command=self.on_stop_capture,
+                      relief="flat", bd=0, padx=8, pady=4, state="disabled"), "btn")
         self.capture_stop_btn.pack(side="left", padx=6)
         if IS_MAC:      # Windows 不需要授权，这个按钮没有意义
-            tk.Button(btns, text="授权设置", command=FORWARDER_CLASS.open_settings,
-                      relief="flat", bd=0, padx=8, pady=4, bg="#e6e6e9").pack(side="left")
+            _style(tk.Button(btns, text="授权设置", command=FORWARDER_CLASS.open_settings,
+                             relief="flat", bd=0, padx=8, pady=4), "btn").pack(side="left")
 
-        tk.Label(card, text=f"捕获期间本机按键被吞掉、只发给主机；{STOP_COMBO} 随时停止。",
-                 bg=CARD_BG, fg=INK_SOFT, justify="left", wraplength=320).grid(
-            row=2, column=0, sticky="w", pady=(8, 0))
+        _style(tk.Label(body,
+                        text=f"捕获期间本机按键被吞掉、只发给主机；{STOP_COMBO_2} 随时停止。",
+                        bg=T["card"], fg=T["ink_soft"], justify="left", wraplength=310),
+               "soft").grid(row=2, column=0, sticky="w", pady=(8, 0))
 
         return card
 
     def _build_bios_card(self, parent):
-        card = _mk_card(parent, "BIOS 启动键")
-        for col in range(4):
-            card.columnconfigure(col, weight=1, uniform="bios")
+        """BIOS 启动键：主机开机自检时链路还没连上，客户端发不出任何按键，
+        所以让固件自己在 USB 枚举完成后连发这个键，覆盖整个 POST 窗口。
+
+        键位用 8 列网格而不是分段控件：分段控件塞不下 F1~F12 全键
+        （段一多就互相挤着溢出边界）。网格还有个好处——点一下只是「选中」，
+        真正写进固件要再按一次「写入固件」，不会误触。
+        """
+        card = self._new_card(parent, "BIOS 启动键", key="bios",
+                              summary=self._bios_card_summary())
+        body = card.body
+        columns = 8
+        for col in range(columns):
+            body.columnconfigure(col, weight=1, uniform="bios")
 
         self.bios_var = tk.StringVar(value=self.bios_current)
         for index, (label, token) in enumerate(BIOS_KEYS):
-            btn = tk.Radiobutton(card, text=label, value=token, variable=self.bios_var,
-                                 indicatoron=0, command=self.on_bios_key, relief="flat",
-                                 bd=0, padx=4, pady=3, bg="#e6e6e9",
-                                 selectcolor="#cfe6ff", fg=INK,
-                                 activebackground="#dcdce0")
-            btn.grid(row=index // 4, column=index % 4, sticky="ew", padx=2, pady=2)
+            # width=3 把 15 个格子钉成等宽（"F12" 三个字符），否则 Del / 关闭
+            # 各自的字宽不一样，8 列会左右错开，而且整卡会宽到挤掉旁边的列
+            btn = _style(tk.Radiobutton(body, text=label, value=token,
+                                        variable=self.bios_var, indicatoron=0, width=3,
+                                        command=self.on_bios_key, relief="flat", bd=0,
+                                        padx=1, pady=3, font=(UI_FAMILY, 10)),
+                         "select")
+            btn.grid(row=index // columns, column=index % columns,
+                     sticky="ew", padx=1, pady=1)
 
-        row = tk.Frame(card, bg=CARD_BG)
-        row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        tk.Button(row, text="立即连发", command=self.on_bios_now, relief="flat", bd=0,
-                  padx=8, pady=4, bg="#e6e6e9").pack(side="left")
-        tk.Button(row, text="查询", command=self.on_bios_query, relief="flat", bd=0,
-                  padx=8, pady=4, bg="#e6e6e9").pack(side="left", padx=6)
+        # 连发节奏：这两项最终写进固件的 NVS，掉电保持
+        tune = _style(tk.Frame(body, bg=T["card"]), "card")
+        tune.grid(row=2, column=0, columnspan=columns, sticky="ew", pady=(8, 0))
 
-        self.bios_note_var = tk.StringVar(value="固件当前：delete")
-        tk.Label(card, textvariable=self.bios_note_var, bg=CARD_BG, fg=INK_SOFT,
-                 wraplength=300, justify="left").grid(
-            row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.boot_window_var = tk.StringVar(value=f"{self.boot_window:g}")
+        self.boot_gap_var = tk.StringVar(value=f"{self.boot_gap:g}")
+
+        _style(tk.Label(tune, text="时长", bg=T["card"], fg=T["ink_soft"],
+                        font=(UI_FAMILY, 10)), "soft").pack(side="left")
+        self.window_spin = _style(
+            tk.Spinbox(tune, from_=BOOT_WINDOW_RANGE[0], to=BOOT_WINDOW_RANGE[1],
+                       increment=1, width=4, justify="right", relief="flat", bd=0,
+                       highlightthickness=1, textvariable=self.boot_window_var,
+                       command=self._on_boot_tune, font=(UI_FAMILY, 10)), "spin")
+        self.window_spin.pack(side="left", padx=(4, 2))
+        _style(tk.Label(tune, text="秒", bg=T["card"], fg=T["ink_soft"],
+                        font=(UI_FAMILY, 10)), "soft").pack(side="left")
+
+        _style(tk.Label(tune, text="间隔", bg=T["card"], fg=T["ink_soft"],
+                        font=(UI_FAMILY, 10)), "soft").pack(side="left", padx=(12, 0))
+        self.gap_spin = _style(
+            tk.Spinbox(tune, from_=BOOT_GAP_RANGE[0], to=BOOT_GAP_RANGE[1],
+                       increment=20, width=5, justify="right", relief="flat", bd=0,
+                       highlightthickness=1, textvariable=self.boot_gap_var,
+                       command=self._on_boot_tune, font=(UI_FAMILY, 10)), "spin")
+        self.gap_spin.pack(side="left", padx=(4, 2))
+        _style(tk.Label(tune, text="ms", bg=T["card"], fg=T["ink_soft"],
+                        font=(UI_FAMILY, 10)), "soft").pack(side="left")
+
+        # 手输数字（不走 Spinbox 的箭头）时也要跟着变，否则提示停在旧值
+        for spin in (self.window_spin, self.gap_spin):
+            spin.bind("<KeyRelease>", self._on_boot_tune)
+            spin.bind("<FocusOut>", self._on_boot_tune)
+
+        self.boot_tune_var = tk.StringVar(value=self._boot_tune_text())
+        _style(tk.Label(body, textvariable=self.boot_tune_var, bg=T["card"],
+                        fg=T["ink_faint"], font=(UI_FAMILY, 10)), "faint").grid(
+            row=3, column=0, columnspan=columns, sticky="w", pady=(4, 0))
+
+        ops = _style(tk.Frame(body, bg=T["card"]), "card")
+        ops.grid(row=4, column=0, columnspan=columns, sticky="ew", pady=(8, 0))
+        _style(tk.Button(ops, text="写入固件", command=self.on_bios_write, relief="flat",
+                         bd=0, padx=6, pady=4), "btn").pack(side="left")
+        _style(tk.Button(ops, text="立即连发", command=self.on_bios_now, relief="flat",
+                         bd=0, padx=6, pady=4), "primary").pack(side="left", padx=(6, 0))
+        _style(tk.Button(ops, text="查询设置", command=self.on_bios_query, relief="flat",
+                         bd=0, padx=6, pady=4), "btn").pack(side="left", padx=(6, 0))
+
+        self.bios_note_var = tk.StringVar(
+            value="上电后约 1.5 秒开始连发，写一次就一直有效，不用每次开机都开客户端。")
+        _style(tk.Label(body, textvariable=self.bios_note_var, bg=T["card"],
+                        fg=T["ink_faint"], wraplength=248, justify="left",
+                        font=(UI_FAMILY, 10)), "faint").grid(
+            row=5, column=0, columnspan=columns, sticky="w", pady=(6, 0))
 
         return card
 
+    # -- 连发节奏的读写 ----------------------------------------------------
+    @property
+    def boot_window_ms(self):
+        return int(self.boot_window * 1000)
+
+    @property
+    def boot_gap_ms(self):
+        return int(self.boot_gap)
+
+    def _boot_tune_text(self):
+        return f"每 {self.boot_gap_ms}ms 敲一次，持续 {self.boot_window_ms // 1000} 秒"
+
+    def _on_boot_tune(self, _event=None):
+        """从两个输入框取值并夹到合法范围；填坏了就退回上一次的值。"""
+        try:
+            window = float(self.boot_window_var.get())
+        except (ValueError, tk.TclError):
+            window = self.boot_window
+        try:
+            gap = float(self.boot_gap_var.get())
+        except (ValueError, tk.TclError):
+            gap = self.boot_gap
+        self.boot_window = min(max(window, BOOT_WINDOW_RANGE[0]), BOOT_WINDOW_RANGE[1])
+        self.boot_gap = min(max(gap, BOOT_GAP_RANGE[0]), BOOT_GAP_RANGE[1])
+        self.boot_tune_var.set(self._boot_tune_text())
+        self._refresh_bios_summary()
+
+    def _bios_card_summary(self):
+        if self.bios_current == "off":
+            return "已关闭"
+        return (f"{self.bios_current.upper()} · {self.boot_window_ms // 1000} 秒 / "
+                f"{self.boot_gap_ms}ms")
+
+    def _refresh_bios_summary(self):
+        card = self.cards.get("bios")
+        if card is not None:
+            card.set_summary(self._bios_card_summary())
+
     def _build_right_cards(self, parent):
-        holder = tk.Frame(parent, bg=PAGE_BG)
+        holder = _style(tk.Frame(parent, bg=T["canvas"]), "page")
         holder.columnconfigure(0, weight=1)
 
-        text_card = _mk_card(holder, "文字")
-        text_card.grid(row=0, column=0, sticky="ew")
-        text_card.columnconfigure(1, weight=1)
+        text_card = self._new_card(holder, "文字", key="text", summary="未输入")
+        text_card.frame.grid(row=0, column=0, sticky="ew")
+        body = text_card.body
+        body.columnconfigure(0, weight=1)
 
         self.text_var = tk.StringVar()
-        entry = tk.Entry(text_card, textvariable=self.text_var)
-        entry.grid(row=0, column=0, columnspan=3, sticky="ew")
-        entry.bind("<Return>", lambda _e: self.on_send_text(enter=True))
+        self.text_var.trace_add("write", lambda *_a: self._refresh_text_summary())
+        self.text_entry = _style(
+            tk.Entry(body, textvariable=self.text_var, relief="flat", bd=0,
+                     highlightthickness=1, highlightbackground=T["card_stroke"],
+                     highlightcolor=T["brand"]), "entry")
+        self.text_entry.grid(row=0, column=0, columnspan=3, sticky="ew", ipady=3, ipadx=4)
+        self.text_entry.bind("<Return>", lambda _e: self.on_send_text(enter=True))
 
-        tk.Button(text_card, text="输入", command=lambda: self.on_send_text(False),
-                  relief="flat", bd=0, padx=10, pady=3, bg="#e6e6e9").grid(
+        _style(tk.Button(body, text="输入", command=lambda: self.on_send_text(False),
+                         relief="flat", bd=0, padx=10, pady=3), "btn").grid(
             row=1, column=0, sticky="w", pady=(6, 0))
-        tk.Button(text_card, text="输入 + 回车", command=lambda: self.on_send_text(True),
-                  relief="flat", bd=0, padx=10, pady=3, bg="#e6e6e9").grid(
+        _style(tk.Button(body, text="输入 + 回车",
+                         command=lambda: self.on_send_text(True),
+                         relief="flat", bd=0, padx=10, pady=3), "btn").grid(
             row=1, column=1, sticky="w", padx=6, pady=(6, 0))
 
-        presets_card = _mk_card(holder, "常用快捷键")
-        presets_card.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        presets_card = self._new_card(holder, "常用快捷键", key="presets",
+                                      summary="macOS 预设")
+        presets_card.frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
         holder.rowconfigure(1, weight=1)
 
-        notebook = ttk.Notebook(presets_card)
-        notebook.pack(fill="both", expand=True)
-        self._preset_tab(notebook, "macOS", PRESETS_MAC)
-        self._preset_tab(notebook, "Windows", PRESETS_WIN)
+        self.preset_tabs = ttk.Notebook(presets_card.body)
+        self.preset_tabs.pack(fill="both", expand=True)
+        self._preset_tab(self.preset_tabs, "macOS", PRESETS_MAC)
+        self._preset_tab(self.preset_tabs, "Windows", PRESETS_WIN)
+        self.preset_tabs.bind("<<NotebookTabChanged>>", self._on_preset_tab)
+        self._on_preset_tab()        # 默认停在第一页，概要要跟着写对
 
         return holder
 
+    def _refresh_text_summary(self):
+        text = self.text_var.get().strip()
+        if len(text) > 22:
+            text = text[:22] + "…"
+        card = self.cards.get("text")
+        if card is not None:
+            card.set_summary(text or "未输入")
+
+    def _on_preset_tab(self, _event=None):
+        try:
+            title = self.preset_tabs.tab(self.preset_tabs.select(), "text")
+        except tk.TclError:
+            return
+        card = self.cards.get("presets")
+        if card is not None:
+            card.set_summary(f"{title} 预设")
+
     def _preset_tab(self, notebook, title, presets):
-        frame = tk.Frame(notebook, bg=CARD_BG, padx=4, pady=6)
+        frame = _style(tk.Frame(notebook, bg=T["card"], padx=4, pady=6), "card")
         notebook.add(frame, text=title)
         columns = 5
         for col in range(columns):
             frame.columnconfigure(col, weight=1, uniform="pre" + title)
         for index, (label, combo) in enumerate(presets):
-            btn = tk.Button(frame, text=label, relief="flat", bd=0, padx=3, pady=2,
-                            bg="#f0f0f2", activebackground="#e2e2e6",
-                            font=(UI_FAMILY, 10),
-                            command=lambda c=combo: self.on_combo(c))
+            btn = _style(tk.Button(frame, text=label, relief="flat", bd=0, padx=3, pady=2,
+                                   font=(UI_FAMILY, 10),
+                                   command=lambda c=combo: self.on_combo(c)), "btn")
             btn.grid(row=index // columns, column=index % columns,
                      sticky="ew", padx=2, pady=2)
 
     # -- 下部：屏幕键盘（左）+ 鼠标（右） ----------------------------------
     def _build_bottom(self):
-        wrap = tk.Frame(self.root, bg=PAGE_BG, padx=12, pady=4)
+        wrap = _style(tk.Frame(self.root, bg=T["canvas"], padx=12, pady=4), "page")
         wrap.grid(row=2, column=0, sticky="nsew")
         wrap.columnconfigure(0, weight=1)
         wrap.columnconfigure(1, weight=0)
         wrap.rowconfigure(0, weight=1)
 
-        self._build_keyboard(wrap).grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        self._build_mouse(wrap).grid(row=0, column=1, sticky="nsew")
+        self._build_keyboard(wrap).frame.grid(row=0, column=0, sticky="nsew",
+                                              padx=(0, 8))
+        self._build_mouse(wrap).frame.grid(row=0, column=1, sticky="nsew")
 
     def _build_keyboard(self, parent):
-        card = _mk_card(parent, "屏幕键盘（⇧ ⌥ ⌘ ctrl 为粘滞键）")
+        card = self._new_card(parent, "屏幕键盘（⇧ ⌥ ⌘ ctrl 为粘滞键）")
+        body = card.body
         for r, row in enumerate(KB_ROWS):
-            row_frame = tk.Frame(card, bg=CARD_BG)
+            row_frame = _style(tk.Frame(body, bg=T["card"]), "card")
             row_frame.grid(row=r, column=0, sticky="ew", pady=1)
-            card.columnconfigure(0, weight=1)
+            body.columnconfigure(0, weight=1)
             for col in range(len(row)):
                 row_frame.columnconfigure(col, weight=1, uniform=f"kb{r}")
 
             for col, (label, token) in enumerate(row):
-                btn = tk.Button(row_frame, text=label, relief="flat", bd=0, pady=3,
-                                bg="#f4f4f6", activebackground="#e2e2e6", fg=INK,
-                                font=(UI_FAMILY, 10),
-                                command=lambda t=token: self.on_key(t))
+                btn = _style(tk.Button(row_frame, text=label, relief="flat", bd=0,
+                                       pady=3, font=(UI_FAMILY, 10),
+                                       command=lambda t=token: self.on_key(t)), "btn")
                 btn.grid(row=0, column=col, sticky="ew", padx=1)
                 self.key_buttons.setdefault(token, []).append(btn)
                 if token in MODIFIER_TOKENS:
                     self.mod_buttons.setdefault(token, []).append(btn)
-                    btn.configure(fg="#0a5bd0")
+                    btn.configure(fg=T["brand"])
         return card
 
     def _build_mouse(self, parent):
-        card = _mk_card(parent, "鼠标（拖动 = 移动指针）")
-        card.configure(width=320)
-        card.columnconfigure(0, weight=1)
-        card.rowconfigure(0, weight=1)
+        card = self._new_card(parent, "鼠标（拖动 = 移动指针）")
+        body = card.body
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
 
-        self.pad = tk.Canvas(card, width=290, height=104, bg="#fbfbfd",
-                             highlightthickness=1, highlightbackground="#dcdce0",
-                             cursor="hand2")
+        self.pad = _style(tk.Canvas(body, width=290, height=104, bg=T["well"],
+                                    highlightthickness=1,
+                                    highlightbackground=T["card_stroke"],
+                                    cursor="hand2"), "well")
         self.pad.grid(row=0, column=0, sticky="nsew")
         self._pad_hint = self.pad.create_text(145, 52, text="按住拖动",
-                                              fill="#8e8e93", font=(UI_FAMILY, 11))
+                                              fill=T["ink_faint"], font=(UI_FAMILY, 11))
         self.pad.bind("<Configure>", self._pad_resize)
         self.pad.bind("<ButtonPress-1>", self._pad_down)
         self.pad.bind("<B1-Motion>", self._pad_drag)
         self.pad.bind("<ButtonRelease-1>", self._pad_up)
 
-        keys = tk.Frame(card, bg=CARD_BG)
+        keys = _style(tk.Frame(body, bg=T["card"]), "card")
         keys.grid(row=1, column=0, sticky="ew", pady=(8, 0))
         for col in range(3):
             keys.columnconfigure(col, weight=1, uniform="mk")
         for col, (label, name) in enumerate((("左键", "left"), ("中键", "middle"),
                                              ("右键", "right"))):
-            btn = tk.Button(keys, text=label, relief="flat", bd=0, pady=4, bg="#f0f0f2",
-                            activebackground="#e2e2e6")
+            btn = _style(tk.Button(keys, text=label, relief="flat", bd=0, pady=4), "btn")
             btn.grid(row=0, column=col, sticky="ew", padx=2)
             btn.bind("<ButtonPress-1>", lambda _e, n=name: self._mouse_down(n))
             btn.bind("<ButtonRelease-1>", lambda _e, n=name: self._mouse_up(n))
 
-        extra = tk.Frame(card, bg=CARD_BG)
+        extra = _style(tk.Frame(body, bg=T["card"]), "card")
         extra.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         for col in range(3):
             extra.columnconfigure(col, weight=1, uniform="mk2")
-        tk.Button(extra, text="滚轮 ↑", command=lambda: self.on_wheel(3), relief="flat",
-                  bd=0, pady=4, bg="#f0f0f2").grid(row=0, column=0, sticky="ew", padx=2)
-        tk.Button(extra, text="滚轮 ↓", command=lambda: self.on_wheel(-3), relief="flat",
-                  bd=0, pady=4, bg="#f0f0f2").grid(row=0, column=1, sticky="ew", padx=2)
-        self.lock_btn = tk.Button(extra, text="按住左键", command=self.on_drag_lock,
-                                  relief="flat", bd=0, pady=4, bg="#f0f0f2")
+        _style(tk.Button(extra, text="滚轮 ↑", command=lambda: self.on_wheel(3),
+                         relief="flat", bd=0, pady=4), "btn").grid(
+            row=0, column=0, sticky="ew", padx=2)
+        _style(tk.Button(extra, text="滚轮 ↓", command=lambda: self.on_wheel(-3),
+                         relief="flat", bd=0, pady=4), "btn").grid(
+            row=0, column=1, sticky="ew", padx=2)
+        self.lock_btn = _style(
+            tk.Button(extra, text="按住左键", command=self.on_drag_lock,
+                      relief="flat", bd=0, pady=4), "btn")
         self.lock_btn.grid(row=0, column=2, sticky="ew", padx=2)
 
-        speed = tk.Frame(card, bg=CARD_BG)
+        speed = _style(tk.Frame(body, bg=T["card"]), "card")
         speed.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         speed.columnconfigure(1, weight=1)
-        tk.Label(speed, text="速度", bg=CARD_BG, fg=INK_SOFT).grid(row=0, column=0,
-                                                                  sticky="w")
-        self.speed_scale = tk.Scale(speed, from_=0.5, to=4.0, resolution=0.1,
-                                    orient="horizontal", showvalue=0,
-                                    command=self._on_speed, bg=CARD_BG,
-                                    highlightthickness=0, sliderlength=14,
-                                    length=120, troughcolor="#e6e6e9")
+        _style(tk.Label(speed, text="速度", bg=T["card"], fg=T["ink_soft"]), "soft").grid(
+            row=0, column=0, sticky="w")
+        self.speed_scale = _style(
+            tk.Scale(speed, from_=0.5, to=4.0, resolution=0.1, orient="horizontal",
+                     showvalue=0, command=self._on_speed, bg=T["card"],
+                     highlightthickness=0, sliderlength=14, length=120,
+                     troughcolor=T["key"]), "scale")
         self.speed_scale.set(self.mouse_speed)
         self.speed_scale.grid(row=0, column=1, sticky="ew", padx=6)
         self.speed_var = tk.StringVar(value=f"{self.mouse_speed:.1f}×")
-        tk.Label(speed, textvariable=self.speed_var, bg=CARD_BG, fg=INK_SOFT,
-                 width=4, anchor="e").grid(row=0, column=2, sticky="e")
+        _style(tk.Label(speed, textvariable=self.speed_var, bg=T["card"],
+                        fg=T["ink_soft"], width=4, anchor="e"), "soft").grid(
+            row=0, column=2, sticky="e")
 
         return card
 
     # -- 日志 --------------------------------------------------------------
     def _build_log(self):
-        card = tk.LabelFrame(self.root, text=" 日志 ", bg=PAGE_BG, fg=INK_SOFT,
-                             bd=1, relief="solid")
-        card.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        card.columnconfigure(0, weight=1)
+        card = self._new_card(self.root, "日志")
+        card.frame.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
+        body = card.body
+        body.columnconfigure(0, weight=1)
 
-        self.log_text = tk.Text(card, height=6, wrap="word", relief="flat", bd=0,
-                                bg="#fbfbfd", fg=INK, font=(MONO_FAMILY, 10))
+        self.log_text = _style(
+            tk.Text(body, height=6, wrap="word", relief="flat", bd=0,
+                    highlightthickness=0, font=(MONO_FAMILY, 10)), "log")
         self.log_text.grid(row=0, column=0, sticky="ew")
-        scroll = ttk.Scrollbar(card, orient="vertical", command=self.log_text.yview)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.log_text.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=scroll.set, state="disabled")
-        self.log_text.tag_configure("err", foreground="#c7251b")
-        self.log_text.tag_configure("ok", foreground="#1f7a33")
-        self.log_text.tag_configure("recv", foreground="#0a5bd0")
+        self.log_text.tag_configure("err", foreground=T["log_err"])
+        self.log_text.tag_configure("ok", foreground=T["log_ok"])
+        self.log_text.tag_configure("recv", foreground=T["log_recv"])
 
     # -- 事件轮询 ----------------------------------------------------------
     def _poll(self):
@@ -1747,22 +2366,69 @@ class App:
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
+    def _query_boot_config(self):
+        """连上之后主动对齐一次引导键设置。"""
+        if self.link.state != "connected":
+            return
+        self._boot_reply_seen = False
+        self.send(Cmd.BOOT_KEY_QUERY)
+        self.root.after(1600, self._check_boot_reply)
+
+    def _check_boot_reply(self):
+        if self.link.state != "connected" or self._boot_reply_seen:
+            return
+        self._append_log("固件没有回应 BOOTKEY:?：可能是旧固件（不认识引导键命令），"
+                         "要改连发时长/间隔得先用当前源码重新烧录", True)
+
     def _note_reply(self, line):
+        # 新固件会把整套设置一次报回来：BOOTCFG:key=delete,win=10000,gap=220,hold=80
+        if line.startswith("BOOTCFG:") or line.startswith("BOOTKEY:"):
+            self._boot_reply_seen = True
+        cfg = parse_bootcfg(line)
+        if cfg is not None:
+            self._apply_bootcfg(cfg)
+            return
         if line.startswith("BOOTKEY:"):
             token = line.split(":", 1)[1].strip()
-            self.bios_current = token
-            self.bios_var.set(token)
+            self._set_bios_key(token)
             self.bios_note_var.set("固件当前：" + token)
         elif line.startswith("BOOTKEY-ERR:"):
             self.bios_note_var.set("固件不认这个键：" + line.split(":", 1)[1])
         elif line.startswith("PONG:"):
             self.hint_var.set("链路正常 · " + line)
 
+    def _set_bios_key(self, token):
+        self.bios_current = token
+        self.bios_var.set(token)
+        self._refresh_bios_summary()
+        save_ui_state(bios_key=token)
+
+    def _apply_bootcfg(self, cfg):
+        """固件回报了真值就同步到控件上：以固件为准，客户端不自作主张。"""
+        if cfg["key"]:
+            self._set_bios_key(cfg["key"])
+        if cfg["win_ms"] > 0:
+            self.boot_window = cfg["win_ms"] / 1000
+            self.boot_window_var.set(f"{self.boot_window:g}")
+        if cfg["gap_ms"] > 0:
+            self.boot_gap = float(cfg["gap_ms"])
+            self.boot_gap_var.set(f"{self.boot_gap:g}")
+        self.boot_tune_var.set(self._boot_tune_text())
+        self.bios_note_var.set(boot_summary(cfg))
+        self._refresh_bios_summary()
+
     def _paint_status(self):
         state = self.link.state
-        color = {"connected": OK, "scanning": ACCENT, "connecting": ACCENT,
-                 "failed": DANGER}.get(state, "#b0b0b5")
+        color = {"connected": T["ok"], "scanning": T["busy"],
+                 "connecting": T["busy"], "failed": T["danger"]}.get(state, T["idle"])
         self.dot.itemconfigure(self._dot_item, fill=color)
+
+        # 刚连上就问一次固件里的真值。客户端记的是「上次点了什么」，固件记的是
+        # 事实，两者可能不一样；照着旧值点一次「写入固件」，就会把已经设好的
+        # 「关闭」悄悄改回 delete —— 表现正是「设了关闭，开机还是敲键」。
+        if state == "connected" and self._last_link_state != "connected":
+            self.root.after(600, self._query_boot_config)
+        self._last_link_state = state
 
         left = self.link.remaining()
         if left > 0 and self.link.phase_total > 0:
@@ -1787,14 +2453,14 @@ class App:
         if not FORWARDER_CLASS.available():
             self.trust_var.set("未安装 pyobjc（不能转发本机键盘）" if IS_MAC
                                else "当前平台不支持本机键盘转发")
-            self.trust_dot.itemconfigure(self._trust_item, fill="#b0b0b5")
+            self.trust_dot.itemconfigure(self._trust_item, fill=T["idle"])
         elif FORWARDER_CLASS.trusted():
             self.trust_var.set("无需额外授权（可直接捕获）" if IS_WIN
                                else "已授权辅助功能")
-            self.trust_dot.itemconfigure(self._trust_item, fill=OK)
+            self.trust_dot.itemconfigure(self._trust_item, fill=T["ok"])
         else:
             self.trust_var.set("未授权辅助功能")
-            self.trust_dot.itemconfigure(self._trust_item, fill=DANGER)
+            self.trust_dot.itemconfigure(self._trust_item, fill=T["danger"])
 
         capturing = self.fwd.capturing
         can_capture = FORWARDER_CLASS.available()
@@ -1890,16 +2556,17 @@ class App:
         return up_at
 
     def _flash(self, token):
+        """点一下闪一下：让「点了有反应」看得见，比等日志快。"""
         for btn in self.key_buttons.get(token, []):
             try:
-                btn.configure(bg="#cfe6ff")
+                btn.configure(bg=T["brand_soft"])
             except tk.TclError:
                 return
 
         def restore():
             for btn in self.key_buttons.get(token, []):
                 try:
-                    btn.configure(bg="#f4f4f6")
+                    btn.configure(bg=T["key"])
                 except tk.TclError:
                     return
 
@@ -1909,10 +2576,15 @@ class App:
         active = token in self.sticky
         for btn in self.mod_buttons.get(token, []):
             try:
-                btn.configure(bg="#cfe6ff" if active else "#f4f4f6",
-                              fg="#c7251b" if active else "#0a5bd0")
+                btn.configure(bg=T["brand_soft"] if active else T["key"],
+                              fg=T["danger"] if active else T["brand"])
             except tk.TclError:
                 return
+
+    def _paint_mod_all(self):
+        """换肤时把所有粘滞键重刷一遍（逐个 token 走，别漏掉按下的那几个）。"""
+        for token in set(self.mod_buttons) | set(self.sticky):
+            self._paint_mod(token)
 
     def on_combo(self, combo):
         self.send(Cmd.combo(combo))
@@ -1930,16 +2602,33 @@ class App:
 
     # -- BIOS --------------------------------------------------------------
     def on_bios_key(self):
+        """点键位只是「选中」，不立刻写固件——避免误触把板子改成连发别的键。"""
+        token = self.bios_var.get()
+        self._set_bios_key(token)
+        self._append_log(f"已选中 {token.upper() if token != 'off' else '关闭'}，"
+                         f"按「写入固件」才会生效")
+
+    def on_bios_write(self):
+        """键位 + 连发节奏一起写进 NVS，掉电保持。"""
+        self._on_boot_tune()
         token = self.bios_var.get()
         self.send(Cmd.boot_key(token))
-        self._append_log(f"写入引导键：{token}（掉电保持）")
+        self.send(Cmd.boot_key_window(self.boot_window_ms))
+        self.send(Cmd.boot_key_gap(self.boot_gap_ms))
+        self._set_bios_key(token)
+        self._append_log(f"写入固件：{token} · {self.boot_window_ms // 1000} 秒 / "
+                         f"{self.boot_gap_ms}ms（掉电保持）")
 
     def on_bios_now(self):
-        self.send(Cmd.BOOT_KEY_NOW)
-        self._append_log("让固件立即重来一轮连发")
+        """一次带上参数：少一次往返，也不会有「按了立即连发却用的是旧值」的错觉。"""
+        self._on_boot_tune()
+        self.send(Cmd.boot_key_now(self.boot_window_ms, self.boot_gap_ms))
+        self._append_log(f"让固件立即重来一轮连发（{self.boot_gap_ms}ms × "
+                         f"{self.boot_window_ms // 1000} 秒）")
 
     def on_bios_query(self):
         self.send(Cmd.BOOT_KEY_QUERY)
+        self._append_log("查询固件里的引导键设置")
 
     # -- 鼠标 --------------------------------------------------------------
     def _pad_resize(self, event):
@@ -2003,11 +2692,17 @@ class App:
         if self.drag_lock:
             self.drag_lock = False
             self._mouse_up("left")
-            self.lock_btn.configure(text="按住左键", bg="#f0f0f2")
+            self.lock_btn.configure(text="按住左键")
         else:
             self.drag_lock = True
             self._mouse_down("left")
-            self.lock_btn.configure(text="松开左键", bg="#ffd9a0")
+            self.lock_btn.configure(text="松开左键")
+        self._paint_lock()
+
+    def _paint_lock(self):
+        """锁着的时候按钮用琥珀色底，一眼能看出「主机左键还按着」。"""
+        self.lock_btn._role = "warn_soft" if self.drag_lock else "btn"
+        _paint(self.lock_btn, self.lock_btn._role)
 
     def _on_speed(self, value):
         self.mouse_speed = float(value)
@@ -2198,6 +2893,8 @@ def main():
     parser.add_argument("--host", default=DEFAULT_HOST, help="Wi-Fi 链路的主机地址")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Wi-Fi 链路的端口")
     parser.add_argument("--cli", action="store_true", help="命令行模式")
+    parser.add_argument("--theme", choices=("auto", "light", "dark"), default=None,
+                        help="界面配色，auto 跟随系统（默认；界面里也可以当场切换）")
     args = parser.parse_args()
 
     if args.cli:
@@ -2213,9 +2910,18 @@ def main():
     root = tk.Tk()
     _choose_fonts(root)
     _apply_window_icon(root)
+
+    # 先藏起来建界面，量完成内容真实需要多大再显示：
+    # BIOS 键位区从 4 列变成 8 列（F1~F12 全给出来）之后，固定 1256 会把右边
+    # 快捷键那 5 列按钮压扁。屏幕装不下就退回可用宽度，让 grid 自己去挤。
+    root.withdraw()
+    App(root, args.name, args.host, args.port, theme=args.theme)
+    root.update_idletasks()
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    root.geometry(f"{min(1256, sw - 80)}x{min(900, sh - 120)}")
-    App(root, args.name, args.host, args.port)
+    need_w = max(1256, min(root.winfo_reqwidth(), sw - 60))
+    need_h = max(760, min(root.winfo_reqheight(), sh - 100))
+    root.geometry(f"{need_w}x{need_h}")
+    root.deiconify()
     root.mainloop()
     return 0
 

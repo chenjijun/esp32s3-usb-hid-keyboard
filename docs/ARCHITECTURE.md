@@ -47,7 +47,8 @@ esp32s3usbhid/
 │   └── esp32s3_ble_keyboard.ino   # ESP32-S3 固件，1450 行单文件自包含
 ├── mac_swift/                     # Swift 版客户端（原生界面 + 本机键盘转发 + 鼠标）
 │   ├── Sources/
-│   │   ├── App.swift              # 入口、窗口尺寸
+│   │   ├── App.swift              # 入口、窗口尺寸、菜单栏项（MenuBarExtra）
+│   │   ├── MenuBar.swift          # 菜单栏图标 + 下拉菜单（开/停捕获、松键、回窗口、退出）
 │   │   ├── ContentView.swift      # 全部界面 + UIState（界面状态、鼠标位移攒批）
 │   │   ├── LinkBridge.swift       # 双链路：CoreBluetooth + NWConnection，状态机与日志
 │   │   ├── KeyForwarder.swift     # CGEventTap 捕获本机键盘 → 协议命令
@@ -61,13 +62,14 @@ esp32s3usbhid/
 │   └── package.sh                 # 打 dmg / zip
 ├── mac_client/                    # Python 版客户端（GUI + CLI，功能与 Swift 版对齐）
 │   ├── ble_keyboard_client.py     # 协议 / 双链路 / 本机键盘转发 / Tkinter 界面 / CLI
-│   ├── build_app.sh              # 生成带蓝牙声明的 ESP32Keyboard.app
+│   ├── build_app.sh              # 生成带蓝牙声明的 ESP32Keyboard.app（固定证书签名）
 │   ├── package_app.sh            # 打 dist/ESP32Keyboard-Python-<版本>.zip
 │   └── requirements.txt           # bleak（必需）+ pyobjc（本机转发用，可选）
 ├── docs/architecture.jpg          # 架构图（由 app.png 压缩而来，README 引用它）
 ├── app.png                        # 架构图原图
 ├── app_icon.png                   # 图标源图（方形裁切后使用）
 ├── platformio.ini                 # 想用 PlatformIO 编译时的配置
+├── tools/test_python_ui.py        # Python 版界面自测（折叠 / 配色对比度 / 命令格式）
 ├── dist/                          # package.sh 产出：dmg / zip（不进 git）
 ├── ESP32KeyboardSwift.app         # Swift 版，双击启动（不进 git）
 ├── ESP32Keyboard.app              # Python 版启动器（不进 git）
@@ -190,6 +192,37 @@ static const char *SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0";
 
 三个通道乘同一个系数，所以色相不变（蓝还是蓝，只是暗）。改完要重新烧录。
 
+**指令闪灯**：每执行完一条协议命令，再白闪一下，闪几下由命令长度决定。这是唯一一个
+「不看屏幕也知道命令进去了没有」的反馈——被控主机全屏、画面被盖住、或者手机端盲打长文本时，
+灯就是全部的回应。
+
+| 命令长度 | 闪几下 | 典型命令 |
+| --- | --- | --- |
+| 1–8 字节 | 1 | `TAP:q`、`RELEASEALL` |
+| 9–32 字节 | 2 | `MOUSE:click right`、`BOOTKEY:?` |
+| 33–128 字节 | 3 | `TYPE:hello` |
+| 129–512 字节 | 4 | 一句话 |
+| 513–1024 字节 | 5 | 一段话 |
+| > 1024 字节 | 6 | 一次粘一大坨 |
+
+白闪是插在链路底色上的：亮的时候白，灭的那一下露出蓝/紫/绿/黄，所以「有命令在走」
+和「链路是什么状态」可以同时读出来。`PING` 心跳不闪（每 10 秒一次，闪起来像故障）；
+`MOUSE:move` / `MOUSE:wheel` 也不闪（客户端是 30Hz 攒批发的），`MOUSE:down/up/click/release` 照闪。
+
+节奏、上限、开关都在文件顶部：
+
+```cpp
+#define LED_CMD_FLASH       1     // 0 = 关掉闪灯，灯只表示链路状态
+#define LED_CMD_ON_MS       45    // 每下亮多久
+#define LED_CMD_GAP_MS      55    // 两下之间灭多久（灭的时候露出底色）
+#define LED_CMD_MAX_BLINKS  6     // 一次最多连闪几下：连发按键时排队累加，到顶就不再叠加
+```
+
+闪灯是**非阻塞**的：`processCommand()` 里只改状态，真正的亮灭由 `loop()` 里每 2ms
+一次的 `ledFlashTick()` 推进。因为那条执行路径上有大量 `delay()`（按键保持 24ms、
+逐字输入的字间隔、鼠标 click 的 40ms、开机连发引导键的 220ms），在那里阻塞闪灯会把
+命令排队、鼠标拖卡。
+
 **Wi-Fi 参数**（文件顶部可改）：
 
 ```cpp
@@ -209,21 +242,45 @@ static const char *SERVICE_UUID = "12345678-1234-5678-1234-56789abcdef0";
 | --- | --- | --- |
 | `BOOTKEY_DEFAULT` | `KT_KEY_DELETE` | 连发哪个键，可改 `KT_KEY_F2` / `KT_KEY_F10` / `KT_KEY_F12` |
 | `BOOTKEY_HOLD_MS` | 80 | 单次按下持续时间。UEFI 的轮询比 Windows 慢（有的 16ms），太短会整次采不到 |
-| `BOOTKEY_GAP_MS` | 220 | 两次之间 |
-| `BOOTKEY_WINDOW_MS` | 10000 | 连发多久 |
+| `BOOTKEY_GAP_MS` | 220 | 两次之间的默认间隔（客户端可改，60~5000ms） |
+| `BOOTKEY_WINDOW_MS` | 10000 | 连发多久的默认值（客户端可改，1~60 秒） |
 | `BOOTKEY_START_MS` | 1500 | 上电后等多久开始（等 USB 枚举完） |
 
-运行时改（写进 NVS，掉电保持，不用重新烧录）：
+运行时改（都写进 NVS，掉电保持，不用重新烧录）：
 
 ```
-BOOTKEY:delete    // 设成 Del
-BOOTKEY:f2        // 设成 F2
-BOOTKEY:off       // 关掉
-BOOTKEY:now       // 立刻重来一轮
-BOOTKEY:?         // 查询
+BOOTKEY:delete        // 设成 Del
+BOOTKEY:f2            // 设成 F2
+BOOTKEY:off           // 关掉
+BOOTKEY:now           // 立刻重来一轮
+BOOTKEY:?             // 查询（回 BOOTKEY:<键> 和 BOOTCFG: 两行）
+BOOTKEY:window 8000   // 连发时长 8 秒（1000~60000）
+BOOTKEY:gap 300       // 连发间隔 300ms（60~5000）
+BOOTKEY:now 8000 300  // 立即连发，并顺手把这两个值写进去
 ```
 
-客户端「BIOS 启动键」那张卡片就是这几个命令的按钮。
+参数两种写法都收（`BOOTKEY:window=8000` 等价）。超出范围的值会被夹到区间边界，
+不会报错——客户端手滑输 999999 也只是变成 60 秒。
+
+**回执为什么是两条**：`BOOTKEY:<键>` 只有键名，是给老客户端看的（它们把 `BOOTKEY:`
+后面整段当键名）；完整参数走单独的 `BOOTCFG:key=delete,win=10000,gap=220,hold=80`，
+老客户端不认这条，只会把它当未知回执丢进日志，不会显示成乱码。
+
+客户端「BIOS 启动键」那张卡片就是这些命令的按钮：F1~F12 全给（各家主板进设置的键不一样），
+两个数字框改时长和间隔，「立即连发」会一次带上参数，`BOOTCFG:` 回来后把控件同步成固件里的真值。
+
+**「关闭」是怎么记住的**：NVS 里 `bootkey` 有两种状态必须分开——「从没写过」（用宏里的
+出厂默认 `delete`）和「写成了 0」（明确关闭）。固件用 `prefs.isKey()` 判有没有记录，
+读到 0 就一次也不敲；写完立刻回读比对，写不进去（分区满 / 只读）会回一条 `[WARN]` 让客户端
+显出来。这个区分很重要：早先版本用 `getChar("bootkey", -1)` + `>= 0` 判断，逻辑虽对但语义
+含糊，一旦有别的路径写了脏值就会退回到「出厂默认 delete」，表现就是关闭失效。
+
+**客户端不再自己猜**（这是「设了关闭，开机还是敲键」最真实的成因）：界面里引导键的默认值是
+`delete`，而「写入固件」是把界面上的值原样发过去。用户在上一轮设成关闭、下一轮只想改连发
+时长时顺手点了一次写入，板子就被悄悄改回 delete。现在两处都堵上了——选择存本地（Swift 是
+`UserDefaults` 的 `ui.biosKey`，Python 是 `ui.json` 的 `bios_key`），并且每次连上都自动发一次
+`BOOTKEY:?`，以固件回报的真值为准；固件若只回 `BOOTKEY:` 不回 `BOOTCFG:`，日志里会明确写
+「旧固件，键位能用但改不了连发节奏」。
 
 **只在上电（冷启动）时才连发**：固件读 `esp_reset_reason()`，只有 `ESP_RST_POWERON`
 才开窗口。重新烧录、按板子上的复位键都不会触发，免得连着正在跑的 Windows 时
@@ -358,10 +415,10 @@ cd mac_client
 ./package_app.sh            # → dist/ESP32Keyboard-Python-1.2.0.zip
 ```
 
-### 3. 界面功能（1.2.0 起与 Swift 版对齐）
+### 3. 界面功能（与 Swift 版对齐）
 
 顶部两行：第一行选链路（**蓝牙 / Wi-Fi**）和地址，第二行是「连接 / 停止 / 断开 / 释放全部按键」
-加状态灯、状态文字、倒计时进度条。
+加状态灯、状态文字、倒计时进度条，最右端是「外观」切换。
 
 - **双链路**：和固件的 BOOT 键切换对应。蓝牙用设备名找；Wi-Fi 连板子热点里的
   `192.168.4.1:8266`（先让笔记本连上热点 `ESP32-Keyboard`，密码 `esp32keyboard`）。
@@ -372,15 +429,29 @@ cd mac_client
 - **常用快捷键**：`macOS / Windows` 两页预设。Windows 那页含切换输入法（Win+Space）、
   中英切换（Ctrl+Space）、单按 Shift、布局切换（Ctrl+Shift）、任务管理器、
   Win+D/E/R/I/L、Win+Shift+S 等，走 `COMBO:`。
-- **BIOS 启动键**：Del / F2 / F10 / F12 / F1 / F8 / Esc / 关闭。点一下写进板子 NVS
-  （掉电保持），另有「立即连发」「查询」，固件回 `BOOTKEY:…` 后界面会显示当前值。见「一、8」。
+- **BIOS 启动键**：**Del / Esc / F1~F12 / 关闭**，8 列网格，和 Swift 版同一份清单
+  （各家主板进设置的那个键不统一，干脆全给出来）。点一下只是「选中」，
+  再点「写入固件」才把键位 + 连发时长 + 连发间隔三条一起写进 NVS（掉电保持），
+  不会因为手滑点错就把板子改成连发别的键。另有「立即连发」
+  （`BOOTKEY:now <win> <gap>`，一次带参数，少一次往返）和「查询设置」。
+  固件回 `BOOTCFG:key=…,win=…,gap=…,hold=…` 后，控件和底部那行灰字都按固件真值刷新
+  ——始终以固件为准，客户端不自己记。
+- **折叠**：BIOS 启动键 / 文字 / 常用快捷键三张卡点标题栏就收起，收起时标题右边
+  留一句概要（`DELETE · 10 秒 / 220ms`、输入的文本前 22 个字符、`macOS 预设`）。
+  状态存 `~/Library/Application Support/ESP32Keyboard/ui.json`（Windows 是
+  `%APPDATA%\ESP32Keyboard\ui.json`），下次打开还是那个样子。
+  收起来用的是 `pack_forget` 而不是 `destroy`，所以展开回来输入框内容和日志都还在。
+- **外观**：启动时读系统明暗（macOS `defaults read -g AppleInterfaceStyle`，
+  Windows 注册表 `AppsUseLightTheme`），两套调色板二选一；顶栏「外观」按钮可以在
+  **跟随系统 → 浅色 → 深色** 之间循环，点了当场换色（`retint()` 按控件 role 重刷，
+  不重建界面），选择也会记住。配色和 `mac_swift/Sources/Theme.swift` 是同一组色值。
 - **鼠标**：左边一块拖拽区（按住拖动 = 移指针，速度 0.5×–4×），右边左/中/右三键
   （按下发 `MOUSE:down`、松手发 `MOUSE:up`）、滚轮 ↑↓、以及「按住左键」——
   要框选或拖文件时先锁住主机左键，再拖拖拽区。位移按 30Hz 攒批发送，
   超过 ±127 自动拆包，不会被 HID 的 int8 截断。
 - **本机键盘转发**：「开始捕获」后本机按键被吞掉、原样转给主机，修饰键按 flags 全量镜像，
   所以 Windows 上 Shift、Ctrl+Space、Win+Space 这些纯修饰键操作也能生效。
-  ⌃⌥Esc 紧急停止。未映射的键会放行给本机而不是吞掉。
+  **⌃⇧E**（或 ⌃⌥Esc）紧急停止。未映射的键会放行给本机而不是吞掉。
   这条需要 pyobjc + 「辅助功能」授权。
 - **屏幕键盘**：完整 QWERTY + 方向键 + 空格。
   - `⇧ ⌥ ⌘ ctrl` 是**粘滞键**：点一下高亮，再按任意普通键会发送组合并自动松开修饰键
@@ -444,6 +515,101 @@ open ESP32KeyboardSwift.app
 
 TCP 握手超时 6 秒，失败会自动重试 2 次；断线后会和蓝牙一样自动重连。
 
+### 配色：跟随系统明暗 + 青紫强调
+
+全部颜色集中在 `Theme.swift` 的 `Palette` 里，视图只引用名字，不再各写各的
+`Color(nsColor: .controlBackgroundColor)`。
+
+**为什么能跟随系统**：每个颜色都用 `NSColor(name:dynamicProvider:)` 打包成「浅色值 + 深色值」，
+由 AppKit 按当前外观挑，不用在视图里到处读 `@Environment(\.colorScheme)`，
+也就不会出现「某个角落忘了适配深色」。项目没有 Xcode 工程（`swiftc Sources/*.swift` 直接编），
+用不了 Asset Catalog，动态 NSColor 正好是纯代码能做的等价物。
+
+| 用途 | 浅色 | 深色 |
+| --- | --- | --- |
+| 强调色（标题图标、选中键、进度条） | `#0E8CA6` 青 | `#3BE0FF` 亮青 |
+| 强调色另一端 | `#6C5CE7` 紫 | `#B18CFF` 亮紫 |
+| 窗口底 / 卡片上沿 / 卡片下沿 | `#ECEFF7` / `#FFFFFF` / `#FAFBFE` | `#0D0F14` / `#1C2029` / `#171A22` |
+| 凹槽（拖拽区、日志） | `#E6EAF3` | `#080A0E` |
+| 已连接 / 进行中 / 警告 / 出错 | `#0F9D74` / `#7C5CF0` / `#B9770A` / `#D93F45` | `#3BE0A8` / `#A98BFF` / `#FFC15E` / `#FF7B7B` |
+
+三个值得记下来的决定：
+
+1. **按钮色比装饰色深一档**（`brandButton`，深色下 `#1A8FA8` 而不是 `#3BE0FF`）。
+   `borderedProminent` 的前景色由系统定，深色主题的亮青底上它仍然给白字，白字压亮青看不清。
+   装饰性的青可以亮（上面没有字），按钮的底必须暗。
+   同理有 `onBrand`：压在品牌色块上的文字，深色主题下是近黑的冷色而不是白色。
+2. **深色主题下凹槽要比窗口底更暗**（`well` 比 `canvas` 暗）。一开始两者都很暗、只差一点点，
+   结果底部日志条和窗口背景连成一片，看不出那是一条独立区域。
+3. **分段控件自己画**（`BrandSegmented`）。`NSSegmentedControl` 的选中块跟的是**系统强调色**，
+   SwiftUI 的 `.tint()` 对它不生效，青紫配色里会突兀地冒出一块系统蓝。自绘版本还能精确控制段宽，
+   两段等宽、总宽可预测（顶栏那个槽位原来就是 116pt）。
+
+卡片统一走 `cardSurface()` 修饰符：上下渐变填充、一层极淡的青紫斜向微光（浓度 0.10 → 0，
+目的是「有点颜色」而不是「一眼看出是渐变」）、1pt 描边、柔和投影。
+投影挂在圆角形状上而不是视图上，否则圆角外会多一圈方影。
+
+### 界面：可折叠的三张卡片 + 完整 F1~F12
+
+页面从上到下依次是：连接卡、本机键盘转发、**BIOS 启动键**、**文字**、**常用快捷键**、
+屏幕键盘 + 鼠标。后四块里前三块不是每次都用，堆在一起页面就很长，所以给这三张卡片加了折叠：
+- 点标题栏任意位置收起 / 展开（右边的小箭头会转 90°，收起时朝右）；
+- **收起时标题右边会留一句概要**（`DEL · 10 秒 / 220ms`、当前文字、`Windows 预设`），
+  所以折叠不等于「什么都看不见」；
+- 状态记在 `UserDefaults`（`ui.collapsedSections`），下次打开还是收着的样子。
+
+「本机键盘转发」是横跨整窗的一条工具栏：**「开始捕获」紧跟标题靠左**（以前排在整条的最右端，
+中间隔着大半屏空白，点它之前眼睛得先扫一圈），权限胶囊和「去授权 / 重新检测」留在右边。
+
+### 菜单栏常驻：捕获的第二条出口
+
+菜单栏上常驻一个图标（`App.swift` 里的 `MenuBarExtra` + `MenuBar.swift`），
+平时是键盘符号，**捕获中换成录制圆点**，点开是这些：
+
+| 菜单项 | 说明 |
+|---|---|
+| 链路：… / 捕获：… | 两行只读状态，打开就知道通没通、有没有在吞键盘 |
+| 开始捕获 / 停止捕获 | 和主窗口那个按钮是同一件事 |
+| 释放全部按键 | 发一条 `RELEASEALL`，对付主机上卡住的修饰键 |
+| 去授权（辅助功能）… | **只在没授权时出现**，省得为了点它把窗口找回来 |
+| 显示主窗口 / 退出 | 关掉窗口后还能把窗口叫回来 |
+
+为什么要这个入口：捕获期间本机键盘被整体接管，主窗口的「停止捕获」只能用鼠标点，
+而窗口一旦被盖住、最小化或关掉（关窗口不退进程），键盘又不响应，就真的没有出口了。
+菜单栏图标浮在最上层、鼠标永远点得到，等于给捕获留了一条随时可用的退路。
+
+两个实现细节：
+
+- **图标靠换符号表达状态，不靠换颜色**。菜单栏图标是模板渲染（系统只取形状，
+  颜色随亮/暗菜单栏走），上色没用；所以捕获中换成 `record.circle`。
+- **标签视图自己订阅 `forwarder`**（`StatusBarLabel` 里挂 `@ObservedObject`）：
+  菜单栏项由系统托管，把观察放在标签视图内部最稳，不依赖 `App.body` 重新求值时顺手换图标。
+
+已知取舍：捕获期间菜单里的键盘导航（方向键 / Esc / 回车）也会被 tap 吞掉 ——
+事件在到达菜单之前就被拦下了，用鼠标点即可。另外从菜单栏「退出」时进程会直接结束，
+`KeyForwarder` 监听 `NSApplication.willTerminateNotification` 先走一遍 `stop()`，
+尽量把还按着的键松开（表现上聊胜于无：进程一结束 tap 就没了）。
+
+BIOS 那一块的几个改动：
+
+1. **键位从分段控件换成网格，F1~F12 全部给出**。分段控件塞不下 15 个键：
+   `NSSegmentedControl` 不会压缩段内文字，段一多就互相叠着挤出卡片边界（上一版只有 8 段就已经
+   逼近极限）。网格还有一层好处——点一下只是「选中」，真正写进固件要再按一次按钮，不会误触。
+   键帽**定宽 52pt**、不跟着窗口拉伸：卡片是整窗宽（≥1000pt），8 个弹性列每个会被撑到 100pt
+   以上，一排又宽又扁，看着像主按钮而不是键帽。定宽之后键区只占 456pt，右边空出来的地方放
+   「连发时长 / 间隔」和三个操作按钮（左右两栏），卡片反倒矮了一截。
+2. **连发时长 / 间隔可调**。板子上电后在 POST 阶段自己连发引导键，节奏原本写死在
+   `BOOTKEY_WINDOW_MS` / `BOOTKEY_GAP_MS` 两个宏里，现在改成运行时值、存 NVS：
+
+   | 控件 | 范围 | 对应命令 |
+   | --- | --- | --- |
+   | 连发时长 | 1~60 秒 | `BOOTKEY:window <ms>` |
+   | 连发间隔 | 60~5000 ms | `BOOTKEY:gap <ms>` |
+
+   「立即连发」发的是 `BOOTKEY:now <win> <gap>`，一次带参数：少一次往返，也不会出现
+   「点了立即连发但板子用的是旧值」的错觉。固件回 `BOOTCFG:` 之后，控件会被同步成固件里的真值
+   （以固件为准，客户端不自己记一套）。
+
 ### App 图标
 
 图标来自根目录的 `app_icon.png`。`build.sh` 发现 `Resources/AppIcon.icns` 不存在会
@@ -495,18 +661,51 @@ App 本身是 **universal**（arm64 + x86_64），Intel Mac 也能跑，解压�
 
 **两个限制**：
 
-1. 没有开发者证书，只能 ad-hoc 签名。`codesign --verify` 是有效的，但经网络下载后
-   一定会被 Gatekeeper 标记，需要右键打开绕过（或 `xattr -dr com.apple.quarantine`）。
-2. ad-hoc 签名按二进制指纹识别，**每次重新编译后**，蓝牙和辅助功能授权可能要重新给一次。
+1. 没有 Apple 开发者证书，签名只能是本机自签证书（或 ad-hoc）。
+   `codesign --verify` 是有效的，但经网络下载后一定会被 Gatekeeper 标记，
+   需要右键打开绕过（或 `xattr -dr com.apple.quarantine`）。
+2. **对方机器没有这个自签证书**，所以换机器、发给别人，授权还是要从头给一次。
+   免重复授权是「同一台机器 + 同一个位置」才成立的事。
 
-嫌反复授权麻烦的话，可以建一个自签名证书，让签名身份固定下来：
+### 签名身份：为什么以前每次重编都要重新授权
 
-```bash
-# 钥匙串访问 → 证书助理 → 创建证书 → 类型选「代码签名」→ 名称填 ESP32KeyboardLocal
-SIGN_IDENTITY="ESP32KeyboardLocal" ./mac_swift/build.sh
+macOS 的 TCC（隐私授权）记的是「哪个 App」。App 的身份由代码签名决定，而
+ad-hoc 签名（`codesign -s -`）里唯一能标识它的只有 **cdhash**——每次重新编译都变。
+系统于是认为「这是一个新 App」，于是：
+
+- 系统设置里那条开关**还是勾着的**
+- 但 `AXIsProcessTrusted()` 返回 `false`，点「重新检测」永远不变绿
+
+`build.sh` 现在默认用固定证书签名，签名身份不再随编译变化。做法是先建一个自签名证书
+（只需一次），之后的签名指定要求变成：
+
+```
+identifier "local.esp32keyboard.swift" and certificate leaf = H"5966ab01…"
 ```
 
-这样重编译后授权就不会掉了。
+**里面没有 cdhash**，只有 bundle id + 证书指纹。所以重编一百次，系统都认为还是同一个 App，
+辅助功能和蓝牙授权一直有效。`build.sh` 每次都会把这一行打出来，可以自己确认。
+
+```bash
+./mac_swift/make_cert.sh      # 只跑一次：造证书（openssl 自签 → 专用钥匙串 → 免弹框 → 信任根）
+./mac_swift/build.sh          # 之后每次编译自动认这张证书，不用再传 SIGN_IDENTITY
+./mac_swift/build.sh --install  # 想固定装到 /Applications 时用（见下）
+```
+
+**为什么证书装在专用钥匙串里**（`~/Library/Keychains/esp32-signing.keychain-db`），
+而不是登录钥匙串：`codesign` 读私钥时，如果私钥 ACL 没预放行，macOS 会弹一个
+「codesign 想要访问钥匙串中的密钥」的授权框，等用户输密码。没有图形界面时
+（CI、远程会话、脚本里跑）这个框根本不出现，`codesign` 就一直卡在
+`replacing existing signature` 不动，等五分钟也不会自己好。
+
+登录钥匙串的密码是用户登录密码，脚本无从得知，也就没法自动放行。专用钥匙串密码固定
+（`esp32local`，只保护这张本地自签证书，不含别的凭据），`make_cert.sh` 里那句
+`security set-key-partition-list` 把 codesign 写进私钥的 partition list，
+`build.sh` 每次先 `unlock-keychain` 再签——全自动、不弹框。
+
+**路径也要固定**。TCC 是「bundle id + 路径」一起记的：仓库根目录那份
+`ESP32KeyboardSwift.app` 和 `/Applications` 那份会各存一条记录，两边混着启动，
+就会被要求重新授权两次。挑一个位置用到底，要么仓库根目录，要么 `--install`。
 
 ### 首次运行要授权两次
 
@@ -514,37 +713,25 @@ SIGN_IDENTITY="ESP32KeyboardLocal" ./mac_swift/build.sh
 2. **辅助功能**：点「开始捕获」时提示没有权限 → 点界面里的「去授权」→
    在 隐私与安全性 → 辅助功能 里勾上「ESP32 远程键盘」→ 回到 App 点「重新检测」
 
-> 因为本机没有开发者证书，只能 ad-hoc 签名。**每次重新编译后，这两个授权可能要重新点一次**
-> （系统按二进制指纹认应用）。自用没问题，不能拷给别人用。
+> 从 ad-hoc 换成固定证书的**那一次**，还是得重新授权一次（旧记录是 ad-hoc 时期的，
+> 和新身份对不上）。这一次之后就不用再授权了。
 
 ### 「明明授权了，重新检测还是未授权」
 
-这是 ad-hoc 签名最容易踩的坑，值得单独说清楚。
+先确认 `codesign -d -r- ESP32KeyboardSwift.app` 打出来的指定要求里是
+`certificate leaf = H"…"` 而不是 `cdhash H"…"`：
 
-macOS 的 TCC 是按**代码签名指纹（cdhash）**认程序的。ad-hoc 签名每次重新编译，
-cdhash 都会变。于是会出现这个状态：
+- 是 `cdhash` → 说明还在用 ad-hoc 签名，跑一次 `./mac_swift/make_cert.sh` 再编译
+- 是 `certificate leaf` → 那就是 TCC 里存着一条旧记录（多半是 ad-hoc 时期留下的）
 
-- 系统设置 → 辅助功能 里那条开关**仍然显示为勾选**
-- 但系统认为「这不是同一个程序」，`AXIsProcessTrusted()` 一直返回 `false`
-- 点「重新检测」怎么点都不会变绿
-
-解决顺序：
+旧记录的处理顺序：
 
 1. 点权限胶囊右边的 **重置按钮**（圆形箭头图标）→ 清除失效的旧授权记录
 2. 点「去授权」，在列表里用 **+** 重新添加 `ESP32KeyboardSwift.app`
 3. 回到 App 点「重新检测」
 
 手动做法等价于：在辅助功能列表里选中「ESP32 远程键盘」，点 **—** 删掉，再点 **+** 加回来。
-**仅仅把开关关掉再打开是没用的**，因为那条记录本身已经和当前二进制对不上了。
-
-如果想彻底避免反复授权，用自签名证书把身份固定下来（只需做一次）：
-
-```bash
-./mac_swift/make_cert.sh                                    # 创建证书
-SIGN_IDENTITY="ESP32KeyboardLocal" ./mac_swift/build.sh     # 以后都用这个身份编译
-```
-
-之后重新编译不会再影响已有授权。
+**仅仅把开关关掉再打开是没用的**，因为那条记录本身已经和当前签名对不上了。
 
 ### Python 版：依赖与授权
 
@@ -554,6 +741,11 @@ Python 版（`mac_client/`）功能已经和 Swift 版一致，但有一处差�
   `python3 ble_keyboard_client.py` 直接跑时，被授权的是那个 python 解释器；
   换成 `.app` 启动，被授权的是 `.app` 里的同一个解释器路径——路径变了就要重新勾。
   固定用 `ESP32Keyboard.app` 启动最省事。
+- **签名也是固定的**：`build_app.sh` 和 `build.sh` 共用
+  `make_cert.sh` 造的那张自签证书（专用钥匙串 `esp32-signing.keychain-db`），
+  所以重新打包不会掉蓝牙 / 辅助功能授权。两个 App 的 bundle id 不同
+  （`local.esp32keyboard` / `local.esp32keyboard.swift`），在系统里是两条独立授权，
+  各授权一次即可。没跑过 `make_cert.sh` 时会退回 ad-hoc 并在结尾明确警告。
 - **提示缺少 pyobjc**：`python3 -m pip install -r mac_client/requirements.txt`。
   只有「本机键盘转发」需要它，屏幕键盘、鼠标、快捷键不受影响。
 - **蓝牙仍然必须走 .app**：TCC 只认带 `NSBluetoothAlwaysUsageDescription` 的 App。
@@ -561,6 +753,9 @@ Python 版（`mac_client/`）功能已经和 Swift 版一致，但有一处差�
 - **`build_app.sh` 会把 python 路径写进启动脚本**。之后换 Python 版本（或删了那个
   venv / Homebrew Python），App 会改用 `command -v python3`，并在缺 bleak 时弹窗提示，
   而不是毫无反应地退出。
+- **界面自测**：`python3 tools/test_python_ui.py` 不需要板子、也不需要真的连蓝牙，
+  它把窗口建起来量控件（折叠省了多少高度、颜色对比度够不够、点击发的是哪条命令），
+  改完界面跑一遍比肉眼快。
 
 ### 连接超时与取消
 
@@ -583,7 +778,9 @@ Python 版（`mac_client/`）功能已经和 Swift 版一致，但有一处差�
 
 1. 先连上 ESP32（状态点变绿）
 2. 点「开始捕获」→ 之后在这台 Mac 上敲的键**不会打进本机**，全部发到被控主机
-3. 停止：点「停止」，或按 **⌃⌥Esc**（这个组合键永远优先处理，防止键盘被吞后关不掉）
+3. 停止：点「停止」、按 **⌃⇧E**（备用 **⌃⌥Esc**），或者点**菜单栏图标**里的「停止捕获」。
+   后面这条是为「窗口被盖住 / 关掉了」准备的 —— 键盘已经不响应，只有鼠标还可靠。这两个组合永远优先处理，
+   判断放在「同步修饰键」之前，所以哪怕键盘已经被吞掉也一定停得下来
 4. 断开连接会自动停止捕获，不会让按键掉进黑洞
 
 实现上用的是 `CGEventTap`（`cgSessionEventTap` / `headInsertEventTap`），
@@ -628,11 +825,12 @@ Python 版（`mac_client/`）功能已经和 Swift 版一致，但有一处差�
 
 | | Swift 版 | Python 版 |
 |---|---|---|
-| 界面 | 原生 SwiftUI | Tkinter |
-| 本机键盘转发 | ✅ | ❌ |
-| 依赖 | 无（自己就是 .app） | Python + bleak + tkinter |
+| 界面 | 原生 SwiftUI（渐变卡片、青紫强调） | Tkinter（同色系，纯色代替渐变） |
+| 本机键盘转发 | ✅ CGEventTap | ✅ macOS 走 pyobjc / Windows 走 WH 键盘钩子 |
+| 依赖 | 无（自己就是 .app） | Python + bleak + tkinter（转发另需 pyobjc） |
 | 命令行调试 | ❌ | ✅ `--cli` |
 | 改造/调试难度 | 要改代码得重新编译 | 改完直接跑 |
+| 界面自测 | 离屏渲染截图 | `tools/test_python_ui.py` 量控件 |
 
 两个版本协议完全一致，可以随时换着用。排查链路问题时用 Python 版更省事。
 
@@ -724,36 +922,36 @@ CGEventTap 回调     Button 点击          DragGesture
 如果在 BLE 回调里直接 `delay()` 执行，下一个回调可能在等待期间插进来，把键序打乱。
 队列把「收」和「执行」解耦，执行侧永远是单线程串行的。这也是本项目最核心的一个结构决定。
 
-### 2. 固件代码地图（`esp32s3_ble_keyboard.ino`，约 1450 行，单文件自包含）
-
+### 2. 固件代码地图（`esp32s3_ble_keyboard.ino`，约 1690 行，单文件自包含）
 | 行号 | 段落 | 干什么 |
 | --- | --- | --- |
-| 60–140 | 键码表 | 与核心 `USBHIDKeyboard.h` 的 `KEY_*` 一一对应，用 `static_assert` 做编译期交叉校验 |
-| 141–166 | `KtAction` | 命令类型枚举：TAP / DOWN / UP / TYPE / COMBO / MEDIA / RELEASEALL / PING |
-| 167–377 | 键名解析 | `"enter"`、`"f2"`、`"kp0"`、单字符 → 键码；大小写不敏感 |
-| 378–505 | `kt_parse()` | 一行文本 → `KtPlan`（动作 + 键码数组 + 警告/错误） |
-| 506–572 | 用户配置 | 设备名、GATT UUID、双链路参数、引导键、`LED_BRIGHTNESS` |
-| 573–599 | 编译期检查 | USB Mode 选错时给一句中文 `#error`，而不是让链接期报天书 |
-| 600–632 | 全局对象 | `Keyboard` / `Mouse` / `Consumer` 三个 HID 设备（同一接口，report ID 区分） |
-| 633–687 | 状态灯 | `ledSet` / `ledRefresh` / 上电自检 / 主机灯态回调（按亮度系数缩放） |
-| 688–795 | 按键动作 | `hwPress` / `hwRelease`（绕开库清左 Shift 的行为）、`tapCode`、`typeText`、`doCombo`、`doMedia` |
-| 796–845 | 开机引导键 | 冷启动判定 + 连发窗口 + `serviceBootKey()`，不依赖任何链路 |
-| 846–880 | 命令分发 | `notifyHost()` 统一回执出口、`pushCommand()` 入队 |
-| 881–1036 | BOOTKEY / 鼠标 | `handleBootKeyCommand`（写 NVS）、`handleMouseCommand`（move/wheel/down/up/click/release） |
-| 1037–1098 | `processCommand` | 按前缀分流：`bootkey:`、`mouse:` 截走，其余交给 `kt_parse` |
-| 1099–1287 | 链路 | `startBLE` / `stopBLE` / `startWiFi`（AP）/ `stopWiFi` / `serviceWiFi`（accept + 读行） |
-| 1288–1344 | 模式切换 | `setMode()` 写 NVS、`pollButton()` BOOT 键消抖 |
-| 1345–1452 | `setup` / `loop` | 初始化；主循环 = 按键轮询 → 引导键 → 链路维护 → 取一条命令执行 → 刷灯 |
+| 68–145 | 键码表 | 与核心 `USBHIDKeyboard.h` 的 `KEY_*` 一一对应，用 `static_assert` 做编译期交叉校验 |
+| 146–171 | `KtAction` | 命令类型枚举：TAP / DOWN / UP / TYPE / COMBO / MEDIA / RELEASEALL / PING |
+| 172–382 | 键名解析 | `"enter"`、`"f2"`、`"kp0"`、单字符 → 键码；大小写不敏感 |
+| 383–510 | `kt_parse()` | 一行文本 → `KtPlan`（动作 + 键码数组 + 警告/错误） |
+| 511–605 | 用户配置 | 设备名、GATT UUID、双链路参数、`LED_BRIGHTNESS` / `LED_CMD_*`、引导键默认值与可调范围、按键保持时长 |
+| 606–632 | 编译期检查 | USB Mode 选错时给一句中文 `#error`，而不是让链接期报天书 |
+| 633–665 | 全局对象 | `Keyboard` / `Mouse` / `Consumer` 三个 HID 设备（同一接口，report ID 区分） |
+| 666–795 | 状态灯 | `ledSet` / `ledRefresh` / 上电自检 / 主机灯态回调 / **指令闪灯状态机**（`ledFlashCommand` + `ledFlashTick`） |
+| 796–903 | 按键动作 | `hwPress` / `hwRelease`（绕开库清左 Shift 的行为）、`tapCode`、`typeText`、`doCombo`、`doMedia` |
+| 904–969 | 开机引导键 | 冷启动判定 + 连发窗口状态机 + 运行时可改的 `bootKeyWindowMs` / `bootKeyGapMs` |
+| 970–1137 | 命令分发 | `notifyHost()` / `notifyBootCfg()`、`pushCommand()` 入队、`handleBootKeyCommand()`（键位 / 时长 / 间隔 / 立即连发） |
+| 1138–1252 | 鼠标 | `mouseClamp`、`handleMouseCommand`（move/wheel/down/up/click/release，鼠标键事件在这里触发闪灯） |
+| 1253–1363 | `processCommand` | 按前缀分流：`bootkey:`、`mouse:` 截走，其余交给 `kt_parse`；执行完调用 `ledFlashCommand()`（`PING` 除外） |
+| 1364–1510 | 链路 | `startBLE` / `stopBLE` / `startWiFi`（AP）/ `stopWiFi` / `serviceWiFi`（accept + 读行） |
+| 1511–1573 | 模式切换 | `setMode()` 写 NVS、`pollButton()` BOOT 键消抖 |
+| 1574–1688 | `setup` / `loop` | 初始化（含读回引导键参数）；主循环 = 按键轮询 → 引导键 → 链路维护 → 取一条命令执行 → `ledFlashTick()` → 刷灯 |
 
-### 3. 客户端代码地图（`mac_swift/Sources`，约 2300 行）
+### 3. 客户端代码地图（`mac_swift/Sources`，约 2860 行）
 
 | 文件 | 行数 | 职责 |
 | --- | --- | --- |
 | `App.swift` | 21 | 入口，窗口最小 1000×620，注入两个 `ObservableObject` |
-| `ContentView.swift` | 1056 | 全部界面 + `UIState`（界面状态、鼠标位移攒批、拖拽锁） |
-| `LinkBridge.swift` | 711 | 双链路：`CBCentralManager` 扫描/连接/写特征，`NWConnection` 走 TCP；`LinkState` 状态机、三阶段超时、倒计时、日志、`tapKey` 串行化 |
-| `KeyForwarder.swift` | 256 | `CGEventTap` 抓本机键盘、修饰键全量镜像、开关捕获时补 `RELEASEALL`、TCC 授权检测 |
-| `Protocol.swift` | 241 | `Command`（命令构造）、`KeyMap`（kVK→键名）、`Layout`（键盘行 / 预设 / BIOS 键）、`ModifierMirror` |
+| `Theme.swift` | 241 | 品牌配色（跟随系统明暗的动态色）、卡片底 `CardSurface`、分段控件 `BrandSegmented`、渐变分隔线 |
+| `ContentView.swift` | 1260 | 全部界面 + `UIState`（界面状态、折叠状态、鼠标位移攒批、拖拽锁）；`Card` 支持点标题栏折叠 |
+| `LinkBridge.swift` | 735 | 双链路：`CBCentralManager` 扫描/连接/写特征，`NWConnection` 走 TCP；`LinkState` 状态机、三阶段超时、倒计时、日志、`tapKey` 串行化、`BOOTCFG` 回执解析 |
+| `KeyForwarder.swift` | 265 | `CGEventTap` 抓本机键盘、修饰键全量镜像、开关捕获时补 `RELEASEALL`、TCC 授权检测 |
+| `Protocol.swift` | 272 | `Command`（命令构造）、`BootConfig`（引导键参数）、`KeyMap`（kVK→键名）、`Layout`（键盘行 / 预设 / BIOS 键）、`ModifierMirror` |
 | `MousePad.swift` | 69 | 拖拽手势（`DragGesture`）+ 鼠标键按下/松开捕捉（`PressCatcher`） |
 
 三层分工很硬：**界面只负责产生 token**（`"a"`、`"ctrl"`、`"f2"`），**协议层只负责拼字符串**，
@@ -818,13 +1016,35 @@ CGEventTap 回调     Button 点击          DragGesture
 - 若列表里根本没有这个 App，点一下界面里的「打开设置」会把它带出来。
 
 **重新编译后权限又要求重新授权**
-- ad-hoc 签名没有稳定身份，系统按二进制指纹认应用，重新编译就等于换了个应用。
-- 自用无所谓；要免掉这个麻烦得用开发者证书签名。
+- 说明这次是 ad-hoc 签名。用 `codesign -d -r- ESP32KeyboardSwift.app` 看一眼：
+  指定要求里出现 `cdhash` 就是 ad-hoc，出现 `certificate leaf` 才是固定证书。
+- 一次性解决：`./mac_swift/make_cert.sh`（只跑一次），之后 `./build.sh` 会自动用这张证书。
+  换身份的那一次仍要重新授权，再往后重编都不用。
+- 另外注意 App 的**路径**：仓库根目录那份和 `/Applications` 那份在 TCC 里是两条记录，
+  混着启动会来回要授权。固定用其中一个（`./build.sh --install` 装到 /Applications 并启动）。
 
 **开了捕获后键盘「失灵」了**
 - 这是设计如此：按键被吞掉转发到被控主机，本机不再响应。
-- 停止方式：点界面上的「停止」，或按 **⌃⌥Esc**（这个组合永远优先处理）。
-- 如果连窗口都点不到（比如切到别的 App 了），⌃⌥Esc 依然有效 —— 它的处理绕过转发逻辑。
+- 停止方式：点界面上的「停止」，或按 **⌃⇧E**（备用 ⌃⌥Esc）。
+- 如果连窗口都点不到（比如切到别的 App 了），⌃⇧E 依然有效 —— 它的处理绕过转发逻辑。
+- 为什么要两套：⌃⌥Esc 是 macOS 习惯，但某些远程桌面 / 输入法会先把它吃掉；
+  ⌃⇧E 在键盘左上、左手一伸就到，作为第二条退路。
+
+**设了「关闭」，板子开机还是敲键**
+
+按这个顺序查，基本能在一步内定位：
+
+1. 连上客户端点「查询设置」，看回执里 `key=` 是什么。若是 `key=off` 而板子还敲，
+   那是板子跑的固件比当前源码旧（旧版本可能不认识 `BOOTKEY:off`，或者没有
+   `isKey` 那套语义），用当前源码重新烧录一次即可。
+2. 若回执里是 `key=delete`，说明「关闭」根本没写进去。看日志里有没有
+   `[WARN] 引导键没写进 NVS` —— 有就是 NVS 写失败（分区满 / 只读）。
+3. 若日志里连 `BOOTCFG:` 都没有，只有 `BOOTKEY:`，那是更老的固件：
+   键位能用，但 `BOOTKEY:window` / `gap` 不认识，连发节奏改不了。
+4. 还有一种最容易忽略的：**客户端把旧值写回去了**。界面上的引导键选择以前不存盘，
+   重开 App 就回到 `delete`；这时哪怕只想改连发时长，点一次「写入固件」也会把关闭改回
+   delete。现在的版本会存选择、连上后自动查一次真值，并把「这次写了什么」记进日志
+   （`写入固件：off · 10 秒 / 220ms`），对照即可。
 
 **屏幕键盘点了没反应（已修复）**
 - 症状：鼠标点在键格里，只有正好戳在字母笔画的中间条带才有反应，其余位置全无响应。
